@@ -5,7 +5,13 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 cmake_minimum_required(VERSION 3.16)
-project(obs-irl-source VERSION 1.3.1 LANGUAGES C)
+# CXX is declared here rather than probed with check_language() and enabled
+# on demand: that probe returns NOTFOUND under the Visual Studio generator even
+# where MSVC compiles C++ perfectly well, which silently cost the sync dock on
+# Windows. Declaring it costs nothing — the bundled deps already need a C++
+# compiler for libsrt — and IRL_ENABLE_DOCK still controls whether any C++ of
+# ours is actually built.
+project(obs-irl-source VERSION 1.3.1 LANGUAGES C CXX)
 
 set(OBS_IRL_SOURCE_BUILD_VERSION "${PROJECT_VERSION}")
 find_package(Git QUIET)
@@ -306,18 +312,7 @@ option(IRL_ENABLE_DOCK "Build the IRL Sync dock (requires Qt6 Widgets)" ON)
 
 set(_IRL_DOCK OFF)
 if(IRL_ENABLE_DOCK)
-    # CXX has to be live before find_package(Qt6): Qt's own config module runs
-    # check_cxx_source_compiles() while resolving its dependencies, which is a
-    # hard error in a C-only project. Probed rather than enabled outright so a
-    # toolchain without a C++ compiler still configures — it just loses the
-    # dock, same as a machine without Qt.
-    include(CheckLanguage)
-    check_language(CXX)
-    if(CMAKE_CXX_COMPILER)
-        enable_language(CXX)
-        find_package(Qt6 QUIET COMPONENTS Widgets)
-    endif()
-
+    find_package(Qt6 QUIET COMPONENTS Widgets)
     if(Qt6_FOUND)
         set(_IRL_DOCK ON)
         list(APPEND PLUGIN_SOURCES src/sync-dock.cpp)
