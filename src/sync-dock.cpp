@@ -26,6 +26,9 @@
 #include <QColor>
 #include <QDateTime>
 #include <QFont>
+#include <QFontDatabase>
+#include <QFontMetrics>
+#include <QFrame>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QLabel>
@@ -54,6 +57,22 @@
  * the offset is old enough that everything derived from it is suspect. */
 static constexpr quint64 NTP_STALE_AGE_NS = 300ULL * 1000000000ULL;
 
+/* The clock is redrawn every tick so the milliseconds read as genuinely live
+ * rather than stepping; the table and the alarm blink are decimated from it,
+ * since neither benefits from more than a few updates a second. */
+static constexpr int TICK_MS = 50;
+static constexpr int TABLE_EVERY = 4;  /* ~5Hz */
+static constexpr int BLINK_EVERY = 12; /* toggles every ~600ms */
+
+/* Panel palette. Fixed rather than theme-derived on purpose: the clock is a
+ * self-contained readout that paints its own dark ground, so it looks the same
+ * under every OBS theme — the way a hardware timecode display does. */
+static constexpr const char *PANEL_BG = "#0d1117";
+static constexpr const char *PANEL_BORDER = "#30363d";
+static constexpr const char *PANEL_DIM = "#7d8590";
+static constexpr const char *PANEL_LIVE = "#3fb950";
+static constexpr const char *PANEL_DEAD = "#484f58";
+
 /* ── Frontend entry points ────────────────────────────────── */
 
 typedef bool (*add_dock_by_id_fn)(const char *id, const char *title,
@@ -75,6 +94,19 @@ static void *resolve_frontend_symbol(const char *name)
 }
 
 /* ── Formatting ───────────────────────────────────────────── */
+
+/* Every number in this dock changes in place, so all of them are drawn in the
+ * fixed-pitch face. QFont::setStyleHint(QFont::Monospace) is only a hint and
+ * leaves the proportional UI family in place, which makes digits jump
+ * sideways as they tick — asking QFontDatabase for the real fixed font is what
+ * actually holds them still. */
+static QFont fixedFont(const QWidget *w, int pointDelta = 0, bool bold = false)
+{
+	QFont f = QFontDatabase::systemFont(QFontDatabase::FixedFont);
+	f.setPointSize(w->font().pointSize() + pointDelta);
+	f.setBold(bold);
+	return f;
+}
 
 static QString format_ms(int64_t ms)
 {
@@ -104,17 +136,34 @@ static QColor status_colour(enum irl_sync_status status)
 {
 	switch (status) {
 	case IRL_SYNC_LOCKED:
-		return QColor(39, 174, 96);
+		return QColor(63, 185, 80);
 	case IRL_SYNC_ACQUIRING:
-		return QColor(214, 137, 16);
+		return QColor(210, 153, 34);
 	case IRL_SYNC_TOO_SLOW:
-		return QColor(192, 57, 43);
+		return QColor(248, 81, 73);
 	case IRL_SYNC_STALE:
-		return QColor(146, 43, 33);
+		return QColor(191, 60, 53);
 	case IRL_SYNC_NO_TIMECODE:
 	case IRL_SYNC_OFF:
 	default:
-		return QColor(127, 140, 141);
+		return QColor(125, 133, 144);
+	}
+}
+
+/* "No timecode" alone sends people looking in the wrong place, so each cause
+ * carries its own fix. See irl_sync_tc_reason. */
+static QString no_timecode_text(enum irl_sync_tc_reason reason)
+{
+	switch (reason) {
+	case IRL_SYNC_TC_NO_CLOCK:
+		return QStringLiteral("No timecode · no NTP reference here");
+	case IRL_SYNC_TC_CODEC:
+		return QStringLiteral("No timecode · stream is not H.265");
+	case IRL_SYNC_TC_ABSENT:
+		return QStringLiteral("No timecode · sender is not stamping");
+	case IRL_SYNC_TC_OK:
+	default:
+		return QStringLiteral("No timecode");
 	}
 }
 
@@ -128,15 +177,53 @@ static QString status_text(const struct irl_sync_snapshot &snap)
 	case IRL_SYNC_TOO_SLOW:
 		/* The number is the point: it tells the operator whether to
 		 * raise the offset themselves or call the person in the field. */
-		return QString("▲ Too slow — needs ≥ %1")
+		return QString("▲ Too slow · needs ≥ %1")
 			.arg(format_ms(snap.required_offset_ms));
 	case IRL_SYNC_STALE:
 		return QStringLiteral("▲ No data");
 	case IRL_SYNC_NO_TIMECODE:
-		return QStringLiteral("○ No timecode");
+		return QStringLiteral("○ ") + no_timecode_text(snap.tc_reason);
 	case IRL_SYNC_OFF:
 	default:
 		return QStringLiteral("○ Off");
+	}
+}
+
+/* Spelled out in full where there is room for it. */
+static QString status_tooltip(const struct irl_sync_snapshot &snap)
+{
+	switch (snap.status) {
+	case IRL_SYNC_NO_TIMECODE:
+		switch (snap.tc_reason) {
+		case IRL_SYNC_TC_NO_CLOCK:
+			return QStringLiteral(
+				"This machine has no NTP reference yet, so timecodes "
+				"cannot be placed on a shared clock. Check the NTP "
+				"server above.");
+		case IRL_SYNC_TC_CODEC:
+			return QStringLiteral(
+				"SEI timecodes only exist on H.265/HEVC. Switch the "
+				"sender's codec — Moblin's H.264 path does not write "
+				"them at all.");
+		case IRL_SYNC_TC_ABSENT:
+			return QStringLiteral(
+				"The stream is H.265 but carries no time_code SEI. On "
+				"Moblin: Settings > Streams > (stream) > Video > "
+				"Timecodes, and set an NTP pool. Timecodes only reach "
+				"the wire over SRT, SRTLA or RIST — never RTMP.");
+		default:
+			break;
+		}
+		return QString();
+	case IRL_SYNC_TOO_SLOW:
+		return QStringLiteral(
+			"This feed arrives later than the target offset, so its frames "
+			"are already past their slot. Raise the offset, or improve that "
+			"uplink.");
+	case IRL_SYNC_STALE:
+		return QStringLiteral("This feed has stopped delivering.");
+	default:
+		return QString();
 	}
 }
 
@@ -162,19 +249,16 @@ public:
 	{
 		build();
 
-		/* 5Hz. Fast enough that the clock's milliseconds read as
-		 * moving, slow enough that the numbers stay legible and the
-		 * dock costs nothing. */
 		auto *timer = new QTimer(this);
 		QObject::connect(timer, &QTimer::timeout, this,
-				 [this]() { refresh(); });
-		timer->start(200);
+				 [this]() { tick(); });
+		timer->start(TICK_MS);
 	}
 
 private:
 	QLabel *clockLabel = nullptr;
-	QLabel *ntpLabel = nullptr;
 	QLabel *showingLabel = nullptr;
+	QLabel *ntpLabel = nullptr;
 	QLabel *recommendedLabel = nullptr;
 	QLabel *summaryLabel = nullptr;
 	QSpinBox *offsetSpin = nullptr;
@@ -183,38 +267,17 @@ private:
 	QPushButton *autoButton = nullptr;
 	QTableWidget *table = nullptr;
 
-	int blinkTicks = 0;
+	int ticks = 0;
 	bool blinkOn = false;
 	int64_t recommendedMs = 0;
 
 	void build()
 	{
 		auto *root = new QVBoxLayout(this);
-		root->setContentsMargins(10, 10, 10, 10);
-		root->setSpacing(6);
+		root->setContentsMargins(12, 12, 12, 12);
+		root->setSpacing(10);
 
-		clockLabel = new QLabel(QStringLiteral("--:--:--.---"), this);
-		QFont clockFont = clockLabel->font();
-		clockFont.setPointSize(clockFont.pointSize() + 14);
-		clockFont.setBold(true);
-		/* The clock and every latency figure are numbers that change
-		 * in place; a proportional font makes them jitter sideways. */
-		clockFont.setStyleHint(QFont::Monospace);
-		clockLabel->setFont(clockFont);
-		clockLabel->setAlignment(Qt::AlignCenter);
-		root->addWidget(clockLabel);
-
-		ntpLabel = new QLabel(this);
-		ntpLabel->setAlignment(Qt::AlignCenter);
-		root->addWidget(ntpLabel);
-
-		/* Without this line the big clock and the source timecodes
-		 * differ by exactly the offset and look like a bug. */
-		showingLabel = new QLabel(this);
-		showingLabel->setAlignment(Qt::AlignCenter);
-		root->addWidget(showingLabel);
-
-		root->addSpacing(4);
+		root->addWidget(buildClockPanel());
 		root->addLayout(buildControls());
 
 		summaryLabel = new QLabel(this);
@@ -224,6 +287,53 @@ private:
 
 		buildTable();
 		root->addWidget(table, 1);
+	}
+
+	QWidget *buildClockPanel()
+	{
+		auto *panel = new QFrame(this);
+		panel->setObjectName(QStringLiteral("irlClockPanel"));
+		panel->setStyleSheet(
+			QString("#irlClockPanel { background-color: %1;"
+				" border: 1px solid %2; border-radius: 8px; }")
+				.arg(PANEL_BG, PANEL_BORDER));
+
+		auto *box = new QVBoxLayout(panel);
+		box->setContentsMargins(16, 10, 16, 12);
+		box->setSpacing(2);
+
+		auto *caption = new QLabel(QStringLiteral("N T P   T I M E"),
+					   panel);
+		caption->setAlignment(Qt::AlignCenter);
+		QFont capFont = fixedFont(this, -2, true);
+		caption->setFont(capFont);
+		caption->setStyleSheet(QString("color: %1;").arg(PANEL_DIM));
+		box->addWidget(caption);
+
+		clockLabel = new QLabel(QStringLiteral("--:--:--.---"), panel);
+		clockLabel->setAlignment(Qt::AlignCenter);
+		clockLabel->setFont(fixedFont(this, 20, true));
+		/* Reserve the height the digits will need so the panel does not
+		 * resize the moment the clock goes from placeholder to live. */
+		clockLabel->setMinimumHeight(
+			QFontMetrics(clockLabel->font()).height() + 4);
+		box->addWidget(clockLabel);
+
+		/* Without this line the big clock and the source timecodes
+		 * differ by exactly the offset and look like a bug. */
+		showingLabel = new QLabel(panel);
+		showingLabel->setAlignment(Qt::AlignCenter);
+		showingLabel->setFont(fixedFont(this, -1));
+		showingLabel->setStyleSheet(
+			QString("color: %1;").arg(PANEL_DIM));
+		box->addWidget(showingLabel);
+
+		ntpLabel = new QLabel(panel);
+		ntpLabel->setAlignment(Qt::AlignCenter);
+		ntpLabel->setFont(fixedFont(this, -1));
+		box->addWidget(ntpLabel);
+
+		return panel;
 	}
 
 	QHBoxLayout *buildControls()
@@ -239,6 +349,7 @@ private:
 		offsetSpin->setSingleStep(250);
 		offsetSpin->setSuffix(QStringLiteral(" ms"));
 		offsetSpin->setValue(irl_sync_offset_ms());
+		offsetSpin->setFont(fixedFont(this));
 		/* Named on the declaring class: editingFinished and clicked
 		 * are inherited, and spelling the base out keeps the
 		 * pointer-to-member unambiguous. */
@@ -289,6 +400,7 @@ private:
 
 		masterButton = new QPushButton(this);
 		masterButton->setCheckable(true);
+		masterButton->setMinimumWidth(90);
 		QObject::connect(masterButton, &QAbstractButton::clicked, this,
 				 [this](bool checked) {
 					 irl_sync_set_enabled(checked);
@@ -308,15 +420,32 @@ private:
 			 QStringLiteral("Peak 60s"), QStringLiteral("Added"),
 			 QStringLiteral("Error"), QStringLiteral("Status")});
 		table->verticalHeader()->setVisible(false);
+		table->verticalHeader()->setDefaultSectionSize(
+			QFontMetrics(font()).height() + 12);
 		table->setSelectionMode(QAbstractItemView::NoSelection);
 		table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+		table->setFocusPolicy(Qt::NoFocus);
 		table->setAlternatingRowColors(true);
+		/* Row striping carries the eye across; grid lines on top of it
+		 * just add noise at this column count. */
+		table->setShowGrid(false);
+		table->horizontalHeader()->setHighlightSections(false);
+
+		QFont headerFont = table->horizontalHeader()->font();
+		headerFont.setBold(true);
+		table->horizontalHeader()->setFont(headerFont);
+
 		table->horizontalHeader()->setSectionResizeMode(
 			COL_SOURCE, QHeaderView::Stretch);
-		for (int i = COL_SYNC; i < COL_COUNT; i++) {
+		for (int i = COL_SYNC; i < COL_STATUS; i++) {
 			table->horizontalHeader()->setSectionResizeMode(
 				i, QHeaderView::ResizeToContents);
 		}
+		/* Status carries the longest, most important string, so it gets
+		 * room of its own rather than being squeezed by the numbers. */
+		table->horizontalHeader()->setSectionResizeMode(
+			COL_STATUS, QHeaderView::Interactive);
+		table->setColumnWidth(COL_STATUS, 240);
 	}
 
 	void updateMasterButton(bool enabled)
@@ -331,21 +460,37 @@ private:
 		QTableWidgetItem *item = table->item(row, column);
 		if (!item) {
 			item = new QTableWidgetItem();
-			if (column != COL_SOURCE)
+			if (column == COL_SOURCE)
+				item->setTextAlignment(Qt::AlignLeft |
+						       Qt::AlignVCenter);
+			else if (column == COL_STATUS)
+				item->setTextAlignment(Qt::AlignLeft |
+						       Qt::AlignVCenter);
+			else
 				item->setTextAlignment(Qt::AlignCenter);
+
+			/* The measured columns tick in place; the fixed face
+			 * keeps them from shifting under the header. */
+			if (column >= COL_TIMECODE && column <= COL_ERROR)
+				item->setFont(fixedFont(this));
 			table->setItem(row, column, item);
 		}
 		return item;
 	}
 
-	void refresh()
+	void tick()
 	{
 		struct irl_sync_config cfg;
 		irl_sync_config_get(&cfg);
 
 		refreshClock(cfg);
-		refreshControls(cfg);
-		refreshTable();
+
+		if (++ticks % BLINK_EVERY == 0)
+			blinkOn = !blinkOn;
+		if (ticks % TABLE_EVERY == 0) {
+			refreshControls(cfg);
+			refreshTable();
+		}
 	}
 
 	void refreshClock(const struct irl_sync_config &cfg)
@@ -354,13 +499,15 @@ private:
 		irl_ntp_get_status(&ntp);
 
 		int64_t utc_ns = 0;
-		if (irl_ntp_utc_now_ns(&utc_ns)) {
+		const bool live = irl_ntp_utc_now_ns(&utc_ns);
+
+		if (live) {
 			const qint64 ms = utc_ns / 1000000LL;
 			clockLabel->setText(
 				QDateTime::fromMSecsSinceEpoch(ms).toString(
 					QStringLiteral("HH:mm:ss.zzz")));
 			showingLabel->setText(
-				QString("Showing %1  (offset −%2)")
+				QString("SHOWING  %1   ·   OFFSET  −%2")
 					.arg(QDateTime::fromMSecsSinceEpoch(
 						     ms - cfg.offset_ms)
 						     .toString(QStringLiteral(
@@ -374,10 +521,13 @@ private:
 			showingLabel->setText(
 				cfg.enabled
 					? QStringLiteral(
-						  "No clock reference — sync cannot run")
+						  "NO CLOCK REFERENCE — SYNC CANNOT RUN")
 					: QStringLiteral(
-						  "Turn sync on to start the clock reference"));
+						  "TURN SYNC ON TO START THE CLOCK"));
 		}
+		clockLabel->setStyleSheet(
+			QString("color: %1; letter-spacing: 2px;")
+				.arg(live ? PANEL_LIVE : PANEL_DEAD));
 
 		/* An unreachable server keeps the last offset ticking along
 		 * plausibly, so freshness is reported, not just "synced". */
@@ -400,11 +550,12 @@ private:
 			fault = cfg.enabled && ntp.age_ns > NTP_STALE_AGE_NS;
 		}
 
-		ntpLabel->setText(QString("NTP  %1  —  %2")
+		ntpLabel->setText(QString("%1  ·  %2")
 					  .arg(QString::fromUtf8(ntp.server))
 					  .arg(health));
 		ntpLabel->setStyleSheet(
-			fault ? QStringLiteral("color: #c0392b;") : QString());
+			QString("color: %1;")
+				.arg(fault ? "#f85149" : PANEL_DIM));
 	}
 
 	void refreshControls(const struct irl_sync_config &cfg)
@@ -432,13 +583,6 @@ private:
 		const size_t count = irl_sync_collect(
 			entries, sizeof(entries) / sizeof(entries[0]));
 
-		/* Toggles every ~600ms: legible as a warning, slow enough not
-		 * to read as a strobe. */
-		if (++blinkTicks >= 3) {
-			blinkTicks = 0;
-			blinkOn = !blinkOn;
-		}
-
 		if (table->rowCount() != static_cast<int>(count))
 			table->setRowCount(static_cast<int>(count));
 
@@ -460,6 +604,8 @@ private:
 
 			const bool measured = s.have_timecode &&
 					      s.status != IRL_SYNC_OFF;
+			const bool aligning = s.status == IRL_SYNC_LOCKED ||
+					      s.status == IRL_SYNC_ACQUIRING;
 			cell(row, COL_LATENCY)
 				->setText(measured ? format_ms(s.latency_ms)
 						   : QStringLiteral("—"));
@@ -468,27 +614,26 @@ private:
 						  ? format_ms(s.latency_peak_ms)
 						  : QStringLiteral("—"));
 			cell(row, COL_ADDED)
-				->setText(s.status == IRL_SYNC_LOCKED ||
-						  s.status == IRL_SYNC_ACQUIRING
-						  ? format_ms(s.added_ms)
-						  : QStringLiteral("—"));
+				->setText(aligning ? format_ms(s.added_ms)
+						   : QStringLiteral("—"));
 			cell(row, COL_ERROR)
-				->setText(s.status == IRL_SYNC_LOCKED ||
-						  s.status == IRL_SYNC_ACQUIRING
-						  ? format_ms(s.error_ms)
-						  : QStringLiteral("—"));
+				->setText(aligning ? format_ms(s.error_ms)
+						   : QStringLiteral("—"));
 
 			QTableWidgetItem *status = cell(row, COL_STATUS);
 			status->setText(status_text(s));
 			status->setForeground(status_colour(s.status));
+			const QString tip = status_tooltip(s);
+			status->setToolTip(tip);
+			cell(row, COL_SOURCE)->setToolTip(tip);
 
 			const bool alarm = s.status == IRL_SYNC_TOO_SLOW ||
 					   s.status == IRL_SYNC_STALE;
 			if (alarm) {
 				alarms++;
 				status->setBackground(
-					blinkOn ? QBrush(QColor(192, 57, 43,
-								90))
+					blinkOn ? QBrush(QColor(248, 81, 73,
+								70))
 						: QBrush(Qt::NoBrush));
 			} else {
 				status->setBackground(QBrush(Qt::NoBrush));
@@ -514,8 +659,8 @@ private:
 					.arg(alarms == 1
 						     ? QString()
 						     : QStringLiteral("s")));
-			summaryLabel->setStyleSheet(
-				QStringLiteral("color: #c0392b; font-weight: bold;"));
+			summaryLabel->setStyleSheet(QStringLiteral(
+				"color: #f85149; font-weight: bold;"));
 			summaryLabel->show();
 		} else {
 			summaryLabel->hide();

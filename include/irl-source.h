@@ -540,6 +540,7 @@ struct irl_source {
 	 * these, which is why none of them need a lock. */
 	struct irl_packet_delay sync_delay;
 	enum irl_sync_status sync_status;
+	enum irl_sync_tc_reason sync_tc_reason;
 	bool sync_engaged;
 	bool sync_locked;
 	bool sync_have_tc;

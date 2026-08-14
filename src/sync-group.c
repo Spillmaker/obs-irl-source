@@ -80,6 +80,21 @@ const char *irl_sync_status_name(enum irl_sync_status status)
 	return "unknown";
 }
 
+const char *irl_sync_tc_reason_name(enum irl_sync_tc_reason reason)
+{
+	switch (reason) {
+	case IRL_SYNC_TC_OK:
+		return "ok";
+	case IRL_SYNC_TC_NO_CLOCK:
+		return "no_clock";
+	case IRL_SYNC_TC_CODEC:
+		return "codec";
+	case IRL_SYNC_TC_ABSENT:
+		return "absent";
+	}
+	return "unknown";
+}
+
 /* ── Settings ─────────────────────────────────────────────── */
 
 static void sync_config_save(void);

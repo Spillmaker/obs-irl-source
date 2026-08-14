@@ -158,7 +158,7 @@ means every feed waits for the slowest one.
 | **Locked** | Aligned, within a frame or two |
 | **Acquiring** | Converging. Normal at startup and after an offset change |
 | **Too slow** | The feed arrives later than the offset. Raise the offset, or improve that uplink |
-| **No timecode** | Nothing to align against: the sender is not stamping (H.264, RTMP, Timecodes off, or no NTP pool set on the device), or this machine has no NTP reference. Not a sync failure — the offset will not help |
+| **No timecode** | Nothing to align against. The dock says which of three causes it is: *no NTP reference here*, *stream is not H.265*, or *sender is not stamping*. Not a sync failure — the offset will not help |
 | **No data** | The feed stopped delivering |
 | **Off** | Sync is off, or this source is not ticked |
 
@@ -291,8 +291,9 @@ bot does not have to reimplement the policy. `clock` reports the NTP reference
 as `{synced, server, offset_ms, rtt_ms, age_ms, utc_ms}`; a large `age_ms` means
 the reference has gone stale and everything downstream of it is suspect. Each
 entry in `sources` carries `source_name`, `sync_enabled`, `status`, `timecode`,
-`latency_ms`, `latency_peak_ms`, `added_ms`, `error_ms` and
-`required_offset_ms`.
+`latency_ms`, `latency_peak_ms`, `added_ms`, `error_ms`, `required_offset_ms`
+and `timecode_reason` — `ok`, `no_clock`, `codec` or `absent`, which says which
+of the three causes of a `no_timecode` status applies.
 
 Every response carries `success`. When it is `false`, `error` says why: no source by that name, that source is not an IRL Source, no IRL Source at all, or more than one with no `source_name` given. Stream URLs are deliberately not exposed, because they can carry an SRT passphrase or a stream key and every connected client would see them.
 

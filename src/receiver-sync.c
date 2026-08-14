@@ -251,11 +251,65 @@ static int64_t peak_value(const struct irl_source *ctx)
 
 /* ── Status publication ───────────────────────────────────── */
 
+/* Work out why nothing is arriving to align against.
+ *
+ * Ordered by what the operator can act on soonest: a missing clock is local,
+ * a wrong codec is one setting on the sender, and "absent" is everything else
+ * about how the sender is configured. */
+static enum irl_sync_tc_reason diagnose_missing_timecode(struct irl_source *ctx)
+{
+	int64_t utc_ns;
+
+	if (!irl_ntp_utc_now_ns(&utc_ns))
+		return IRL_SYNC_TC_NO_CLOCK;
+
+	if (ctx->fmt_ctx && ctx->video_stream_idx >= 0 &&
+	    ctx->fmt_ctx->streams[ctx->video_stream_idx]->codecpar->codec_id !=
+		    AV_CODEC_ID_HEVC)
+		return IRL_SYNC_TC_CODEC;
+
+	return IRL_SYNC_TC_ABSENT;
+}
+
+/* Said once per transition, so a stream that simply never carries timecodes
+ * explains itself in the log without repeating every packet. */
+static void set_tc_reason(struct irl_source *ctx, enum irl_sync_tc_reason reason)
+{
+	if (ctx->sync_tc_reason == reason)
+		return;
+	ctx->sync_tc_reason = reason;
+
+	switch (reason) {
+	case IRL_SYNC_TC_NO_CLOCK:
+		blog(LOG_WARNING,
+		     "[irl-source] Sync: no NTP reference on this machine yet; check the server in the IRL Sync dock");
+		break;
+	case IRL_SYNC_TC_CODEC:
+		blog(LOG_WARNING,
+		     "[irl-source] Sync: stream is %s, but SEI timecodes only exist on H.265/HEVC; switch the sender's codec",
+		     ctx->fmt_ctx && ctx->video_stream_idx >= 0
+			     ? avcodec_get_name(
+				       ctx->fmt_ctx
+					       ->streams[ctx->video_stream_idx]
+					       ->codecpar->codec_id)
+			     : "not H.265");
+		break;
+	case IRL_SYNC_TC_ABSENT:
+		blog(LOG_WARNING,
+		     "[irl-source] Sync: H.265 stream carries no time_code SEI; enable Timecodes and set an NTP pool on the sender (Moblin: Settings > Streams > Video > Timecodes)");
+		break;
+	case IRL_SYNC_TC_OK:
+		blog(LOG_INFO, "[irl-source] Sync: timecodes detected");
+		break;
+	}
+}
+
 static void publish(struct irl_source *ctx)
 {
 	struct irl_sync_snapshot snap = {0};
 
 	snap.status = ctx->sync_status;
+	snap.tc_reason = ctx->sync_tc_reason;
 	snap.have_timecode = ctx->sync_have_tc;
 	snap.tc = ctx->sync_tc;
 	snap.latency_ms = ctx->sync_latency_ns / 1000000LL;
@@ -278,6 +332,7 @@ void irl_sync_reset(struct irl_source *ctx)
 
 	ctx->sync_engaged = false;
 	ctx->sync_status = IRL_SYNC_OFF;
+	ctx->sync_tc_reason = IRL_SYNC_TC_OK;
 	ctx->sync_have_tc = false;
 	ctx->sync_hold_ns = 0;
 	ctx->sync_latency_ns = 0;
@@ -397,8 +452,11 @@ static void observe_timecode(struct irl_source *ctx, const AVPacket *pkt,
 		/* Timecodes are arriving but there is no NTP reference to
 		 * compare them against, so nothing can be aligned. */
 		ctx->sync_status = IRL_SYNC_NO_TIMECODE;
+		set_tc_reason(ctx, IRL_SYNC_TC_NO_CLOCK);
 		return;
 	}
+
+	set_tc_reason(ctx, IRL_SYNC_TC_OK);
 
 	ctx->sync_tc = *tc;
 	ctx->sync_have_tc = true;
@@ -520,6 +578,7 @@ void irl_sync_observe(struct irl_source *ctx, const AVPacket *pkt)
 	if (!sync_wanted(ctx)) {
 		if (ctx->sync_status != IRL_SYNC_OFF) {
 			ctx->sync_status = IRL_SYNC_OFF;
+			ctx->sync_tc_reason = IRL_SYNC_TC_OK;
 			ctx->sync_have_tc = false;
 			ctx->sync_error_ns = 0;
 			ctx->sync_locked = false;
@@ -552,6 +611,7 @@ void irl_sync_observe(struct irl_source *ctx, const AVPacket *pkt)
 			ctx->sync_error_ns = 0;
 			ctx->sync_locked = false;
 		}
+		set_tc_reason(ctx, diagnose_missing_timecode(ctx));
 		ctx->sync_engaged = false;
 		release_hold(ctx, now_ns);
 	}

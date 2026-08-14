@@ -347,6 +347,11 @@ static void vendor_get_sync_status(obs_data_t *request_data,
 		obs_data_set_bool(item, "sync_enabled", e->sync_enabled);
 		obs_data_set_string(item, "status",
 				    irl_sync_status_name(e->snap.status));
+		/* Which of the three causes of "no timecode" this is, so a bot
+		 * can say something actionable instead of just "not synced". */
+		obs_data_set_string(item, "timecode_reason",
+				    irl_sync_tc_reason_name(
+					    e->snap.tc_reason));
 		obs_data_set_int(item, "latency_ms", e->snap.latency_ms);
 		obs_data_set_int(item, "latency_peak_ms",
 				 e->snap.latency_peak_ms);

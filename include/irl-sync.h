@@ -78,6 +78,26 @@ enum irl_sync_status {
 
 const char *irl_sync_status_name(enum irl_sync_status status);
 
+/* Why a source that wants to sync has no timecode to align against.
+ *
+ * "No timecode" on its own sends people hunting in the wrong place — the cause
+ * is almost always one of three specific things, and each has a different fix.
+ * Reporting which one turns a dead end into an instruction. */
+enum irl_sync_tc_reason {
+	IRL_SYNC_TC_OK,
+	/* This machine has no NTP reference, so nothing can be compared. */
+	IRL_SYNC_TC_NO_CLOCK,
+	/* The stream is not H.265. Moblin only writes the SEI on HEVC (its
+	 * H.264 path is disabled at the source), and the timecode SEI this
+	 * reads is HEVC-specific, so H.264 can never carry one. */
+	IRL_SYNC_TC_CODEC,
+	/* HEVC, but no time_code SEI is arriving: Timecodes off on the sender,
+	 * no NTP pool set there, or a transport that drops the SEI. */
+	IRL_SYNC_TC_ABSENT,
+};
+
+const char *irl_sync_tc_reason_name(enum irl_sync_tc_reason reason);
+
 /* What one source publishes for the dock and the websocket vendor.
  *
  * The three latency figures answer different questions and are deliberately
@@ -87,6 +107,8 @@ const char *irl_sync_status_name(enum irl_sync_status status);
  * target, and `error_ms` is how far the actual presentation lands from it. */
 struct irl_sync_snapshot {
 	enum irl_sync_status status;
+	/* Only meaningful while status is IRL_SYNC_NO_TIMECODE. */
+	enum irl_sync_tc_reason tc_reason;
 	bool have_timecode;
 	struct irl_timecode tc;
 	int64_t latency_ms;
