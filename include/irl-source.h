@@ -556,6 +556,10 @@ struct irl_source {
 	uint32_t sync_offset_generation;
 	uint64_t sync_last_tc_ns;
 	uint64_t sync_last_adjust_ns;
+	/* No further correction until this instant: the error signal lags a
+	 * hold behind the hold, so the loop has to wait for its own last
+	 * change to land or it winds itself up. See observe_timecode(). */
+	uint64_t sync_settle_until_ns;
 	uint64_t sync_publish_ns;
 	uint64_t sync_too_slow_since_ns;
 	uint64_t sync_in_reach_since_ns;

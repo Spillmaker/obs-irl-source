@@ -69,6 +69,11 @@
  * five-second hold takes about two minutes. */
 #define SYNC_RELEASE_RATE 0.04
 
+/* Slack added to the hold when working out when a correction will show up.
+ * Covers the rest of the pipeline the packet still has to cross once released:
+ * decode, the jitter cushion and the audio output lead. */
+#define SYNC_SETTLE_MARGIN_NS 750000000LL
+
 /* No timecode for this long and the source has stopped being alignable. */
 #define SYNC_TC_STALE_NS 3000000000ULL
 
@@ -339,6 +344,7 @@ void irl_sync_reset(struct irl_source *ctx)
 	ctx->sync_error_ns = 0;
 	ctx->sync_last_tc_ns = 0;
 	ctx->sync_last_adjust_ns = 0;
+	ctx->sync_settle_until_ns = 0;
 	ctx->sync_too_slow_since_ns = 0;
 	ctx->sync_in_reach_since_ns = 0;
 	ctx->sync_applied_offset_ms = 0;
@@ -527,44 +533,83 @@ static void observe_timecode(struct irl_source *ctx, const AVPacket *pkt,
 		int64_t target_ns = (int64_t)now_ns + needed_ns;
 		ctx->sync_error_ns = presentation_ns - target_ns;
 
-		/* Positive error means we are late, so hold less. While
-		 * unlocked the correction is applied outright — nothing is
-		 * aligned yet, so there is no smoothness to protect. Once
-		 * locked it is rate limited, which is what keeps the resulting
-		 * playback trim inside the speed controller's inaudible
-		 * band. */
-		int64_t step_ns = -ctx->sync_error_ns;
-		if (ctx->sync_locked) {
-			int64_t limit_ns =
-				(int64_t)((double)elapsed_ns * SYNC_SLEW_RATE);
-			if (step_ns > limit_ns)
-				step_ns = limit_ns;
-			if (step_ns < -limit_ns)
-				step_ns = -limit_ns;
-		}
+		/* Wait for the last correction to reach the measurement before
+		 * making another one.
+		 *
+		 * This loop's dead time is its own actuator: the error is
+		 * derived from the audio playout offset, which describes audio
+		 * that was *released* a hold ago, so a change to the hold does
+		 * not show up in the error until roughly a hold later.
+		 * Correcting per packet against a stale reading is positive
+		 * feedback dressed as negative — at 60 timecodes a second it
+		 * re-applied the same full correction until the hold hit its
+		 * ceiling within a fraction of a second, leaving the stream
+		 * tens of seconds behind. One correction per settling
+		 * interval converges geometrically instead. */
+		if (now_ns >= ctx->sync_settle_until_ns) {
+			/* Positive error means we are late, so hold less.
+			 * Unlocked the correction is applied outright —
+			 * nothing is aligned yet, so there is no smoothness to
+			 * protect, and the gate above is what makes a full
+			 * step safe. Once locked it is rate limited, which
+			 * keeps the resulting playback trim inside the speed
+			 * controller's inaudible band. */
+			int64_t step_ns = -ctx->sync_error_ns;
+			if (ctx->sync_locked) {
+				int64_t limit_ns = (int64_t)(
+					(double)elapsed_ns * SYNC_SLEW_RATE);
+				if (step_ns > limit_ns)
+					step_ns = limit_ns;
+				if (step_ns < -limit_ns)
+					step_ns = -limit_ns;
+			}
 
-		ctx->sync_hold_ns += step_ns;
+			ctx->sync_hold_ns += step_ns;
+			ctx->sync_last_adjust_ns = now_ns;
+		}
 	}
 
-	ctx->sync_last_adjust_ns = now_ns;
+	/* Ceiling from first principles rather than the configured maximum.
+	 *
+	 * hold = (offset - latency) - pipeline, and the pipeline delay is never
+	 * negative, so the hold can never legitimately exceed what is still
+	 * needed. Bounding it here means a misbehaving loop overshoots by the
+	 * pipeline delay rather than running to IRL_SYNC_MAX_OFFSET_MS and
+	 * parking the stream half a minute behind. */
+	int64_t max_hold_ns = needed_ns > 0 ? needed_ns : 0;
+	if (ctx->sync_hold_ns > max_hold_ns)
+		ctx->sync_hold_ns = max_hold_ns;
+	if (ctx->sync_hold_ns < 0)
+		ctx->sync_hold_ns = 0;
 
-	/* The one invariant that keeps every path above safe: the hold may
-	 * grow as fast as it likes — that only makes packets wait longer — but
-	 * it may never shrink faster than the pipeline can absorb. Shrinking it
-	 * makes queued packets due sooner, and a large enough cut (the user
-	 * lowering the offset by seconds, say) would make the whole line due at
-	 * once and overrun the buffers downstream. Capping the decrease turns
-	 * that into an ordinary drain instead. */
+	/* The one invariant that keeps every path above safe, and deliberately
+	 * applied last so the ceiling cannot bypass it: the hold may grow as
+	 * fast as it likes — that only makes packets wait longer — but it may
+	 * never shrink faster than the pipeline can absorb. Shrinking it makes
+	 * queued packets due sooner, and a large enough cut (the user lowering
+	 * the offset by seconds, or a momentary latency spike pulling the
+	 * ceiling down) would make the whole line due at once and overrun the
+	 * buffers downstream. Capping the decrease turns that into an ordinary
+	 * drain instead. */
 	int64_t floor_ns = prev_hold_ns -
 			   (int64_t)((double)elapsed_ns * SYNC_RELEASE_RATE);
 	if (ctx->sync_hold_ns < floor_ns)
 		ctx->sync_hold_ns = floor_ns;
-
-	int64_t max_hold_ns = (int64_t)IRL_SYNC_MAX_OFFSET_MS * 1000000LL;
 	if (ctx->sync_hold_ns < 0)
 		ctx->sync_hold_ns = 0;
-	if (ctx->sync_hold_ns > max_hold_ns)
-		ctx->sync_hold_ns = max_hold_ns;
+
+	/* Arm the gate whenever the hold actually moved. A change takes the
+	 * larger of the old and new holds to work through the line — packets
+	 * already queued drain at their existing release times — plus the rest
+	 * of the pipeline. */
+	if (ctx->sync_hold_ns != prev_hold_ns) {
+		int64_t propagation_ns = ctx->sync_hold_ns > prev_hold_ns
+						 ? ctx->sync_hold_ns
+						 : prev_hold_ns;
+		ctx->sync_settle_until_ns =
+			now_ns + (uint64_t)propagation_ns +
+			SYNC_SETTLE_MARGIN_NS;
+	}
 
 	update_status(ctx, now_ns, reachable);
 }
