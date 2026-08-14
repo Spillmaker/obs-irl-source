@@ -44,6 +44,15 @@ void *irl_audio_thread(void *data)
 	return NULL;
 }
 
+void irl_dispatch_packet(struct irl_source *ctx, AVPacket *pkt, AVFrame *frame)
+{
+	if (pkt->stream_index == ctx->audio_stream_idx && ctx->audio_dec_ctx)
+		irl_handle_audio_packet(ctx, pkt, frame);
+	else if (pkt->stream_index == ctx->video_stream_idx &&
+		 ctx->video_dec_ctx)
+		irl_handle_video_packet(ctx, pkt, frame);
+}
+
 void *irl_receiver_thread(void *data)
 {
 	struct irl_source *ctx = data;
@@ -93,6 +102,18 @@ void *irl_receiver_thread(void *data)
 				break;
 		}
 
+		/* Sync delay line at its ceiling: stop reading and let the
+		 * transport hold the excess, exactly as the audio bleed pace
+		 * above does. Draining inside the wait is what makes room, so
+		 * this cannot deadlock while packets are becoming due. */
+		while (os_atomic_load_bool(&ctx->thread_active) &&
+		       irl_sync_delay_full(ctx)) {
+			irl_sync_drain(ctx, frame);
+			os_sleep_ms(2);
+		}
+		if (!os_atomic_load_bool(&ctx->thread_active))
+			break;
+
 		ctx->io_start_us = (uint64_t)av_gettime();
 		int ret = av_read_frame(ctx->fmt_ctx, pkt);
 		if (ret < 0) {
@@ -100,15 +121,12 @@ void *irl_receiver_thread(void *data)
 			continue;
 		}
 
-		if (pkt->stream_index == ctx->audio_stream_idx &&
-		    ctx->audio_dec_ctx) {
-			irl_handle_audio_packet(ctx, pkt, frame);
-		} else if (pkt->stream_index == ctx->video_stream_idx &&
-			   ctx->video_dec_ctx) {
-			irl_handle_video_packet(ctx, pkt, frame);
-		}
+		irl_sync_observe(ctx, pkt);
+		if (!irl_sync_hold(ctx, pkt))
+			irl_dispatch_packet(ctx, pkt, frame);
 
 		av_packet_unref(pkt);
+		irl_sync_drain(ctx, frame);
 		irl_log_receiver_stats(ctx);
 	}
 

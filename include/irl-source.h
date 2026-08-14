@@ -36,6 +36,8 @@
 #include <libavutil/time.h>
 #include <libavutil/hwcontext.h>
 #include "audio-buffer.h"
+#include "irl-sei.h"
+#include "irl-sync.h"
 #include "irl-threading.h"
 #include "pts-repair.h"
 
@@ -58,6 +60,7 @@ struct irl_source;
 #define IRL_DEFAULT_LOW_LATENCY_AUDIO false
 #define IRL_DEFAULT_CLOSE_WHEN_INACTIVE false
 #define IRL_DEFAULT_CLEAR_ON_DISCONNECT true
+#define IRL_DEFAULT_SYNC_ENABLED false
 
 /* Min/max buffer are derived from the target rather than exposed as
  * settings: min is the speed controller's low watermark, max is where
@@ -165,6 +168,38 @@ struct irl_source;
  * reconnect. Connect plus stream probe normally completes in under 3s. */
 #define IRL_IO_STALL_TIMEOUT_US 10000000ULL
 
+/* Timecode sync delay line (receiver-sync.c).
+ *
+ * Bounds on the encoded packets held in front of the decoders to reach the
+ * configured presentation offset. Sized for the worst case the offset ceiling
+ * allows: 30s of a high-bitrate feed is tens of megabytes, and the packet
+ * count covers 30s of 60fps video interleaved with audio several times over.
+ * Hitting either ceiling means something pathological, and the receiver loop
+ * applies transport backpressure well before that (see irl_sync_delay_full). */
+#define IRL_SYNC_DELAY_MAX_PACKETS 16384
+#define IRL_SYNC_DELAY_MAX_BYTES (256u * 1024u * 1024u)
+
+/* One encoded packet waiting for its release into the decoder. */
+struct irl_delay_entry {
+	AVPacket *pkt;
+	uint64_t release_ns;
+};
+
+struct irl_packet_delay {
+	/* Allocated on first use, so a source that never syncs pays nothing. */
+	struct irl_delay_entry *entries;
+	int head;
+	int count;
+	size_t bytes;
+	/* Release times are clamped non-decreasing: the hold moves while
+	 * packets are queued, and the decoder must never see them reordered. */
+	uint64_t last_release_ns;
+	/* Packets the line could not take. Should stay zero — the receiver
+	 * loop applies backpressure before the ceilings are reached — so a
+	 * non-zero count is reported rather than absorbed. */
+	uint64_t overflows;
+};
+
 /* One frame waiting for its moment. `due_ns` is the OBS-clock timestamp the
  * PTS mapping produced, sampled once when the frame was decoded — the same
  * sampling point the un-paced path used — so pacing does not change what
@@ -209,6 +244,11 @@ struct irl_config {
 	/* OBS's media source calls this clear_on_media_end and defaults it
 	 * on; same meaning here, minus the local-file cases. */
 	volatile bool clear_on_disconnect; /* hot */
+
+	/* Per-source opt-in to timecode sync. The offset and the master
+	 * switch are global (see irl-sync.h); this only says whether this
+	 * source participates. Hot, so toggling it never drops the stream. */
+	volatile bool sync_enabled; /* hot */
 };
 
 /* ── Main source context ──────────────────────────────────── */
@@ -491,6 +531,37 @@ struct irl_source {
 	 * across show/activate, which would otherwise restart it. OBS
 	 * thread only, like the callbacks that touch it. */
 	bool media_stopped;
+
+	/* ── Timecode sync (receiver-sync.c) ─────────────────
+	 *
+	 * Receiver-thread-owned without exception: the controller runs on the
+	 * packet path and publishes a snapshot to the registry in sync-group.c
+	 * for the dock and the websocket vendor to read. Nothing else touches
+	 * these, which is why none of them need a lock. */
+	struct irl_packet_delay sync_delay;
+	enum irl_sync_status sync_status;
+	bool sync_engaged;
+	bool sync_locked;
+	bool sync_have_tc;
+	struct irl_timecode sync_tc;
+	/* How long packets are held in front of the decoders. The single
+	 * actuator: everything else about sync is measurement. */
+	int64_t sync_hold_ns;
+	int64_t sync_latency_ns;
+	int64_t sync_error_ns;
+	/* Offset the current hold was computed against, plus the generation
+	 * counter that says the user has changed it since. */
+	int sync_applied_offset_ms;
+	uint32_t sync_offset_generation;
+	uint64_t sync_last_tc_ns;
+	uint64_t sync_last_adjust_ns;
+	uint64_t sync_publish_ns;
+	uint64_t sync_too_slow_since_ns;
+	uint64_t sync_in_reach_since_ns;
+	/* Rolling peak of arrival latency, bucketed so it ages out. */
+	int64_t sync_peak_buckets[IRL_SYNC_PEAK_BUCKETS];
+	int sync_peak_bucket;
+	uint64_t sync_peak_bucket_start_ns;
 
 	/* Statistics */
 	uint64_t total_audio_frames;

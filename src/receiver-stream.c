@@ -383,6 +383,10 @@ bool irl_open_stream(struct irl_source *ctx)
 void irl_prepare_new_connection(struct irl_source *ctx)
 {
 	os_atomic_store_bool(&ctx->reconnecting, false);
+	/* Held packets carry the old connection's PTS epoch, and the sync
+	 * controller's hold was measured against a pipeline that no longer
+	 * exists. Both have to start over with the new stream. */
+	irl_sync_reset(ctx);
 	ctx->first_keyframe_received = false;
 	ctx->video_pkt_gate_open = false;
 	ctx->video_pkt_gate_start_us = 0;

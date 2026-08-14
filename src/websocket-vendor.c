@@ -26,18 +26,23 @@
  */
 
 #include <assert.h>
+#include <stdio.h>
 #include <string.h>
 
 #include <obs-module.h>
 
+#include "../include/irl-ntp.h"
 #include "../include/irl-source.h"
+#include "../include/irl-sync.h"
 #include "../third_party/obs-websocket-api.h"
 
 #define IRL_VENDOR_NAME "obs-irl-source"
 
 /* Bumped when a request is added or a response field changes meaning, so a
- * client can feature-detect instead of probing. */
-#define IRL_VENDOR_API_VERSION 1
+ * client can feature-detect instead of probing.
+ *
+ * 2: adds GetSyncStatus and the sync_* fields on GetStats. */
+#define IRL_VENDOR_API_VERSION 2
 
 #define IRL_ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 
@@ -49,6 +54,7 @@ enum irl_stat_type {
 	IRL_STAT_INT,
 	IRL_STAT_FLOAT,
 	IRL_STAT_BOOL,
+	IRL_STAT_STRING,
 };
 
 struct irl_stat_field {
@@ -87,6 +93,14 @@ static const struct irl_stat_field irl_stat_fields[] = {
 	{"stream_delay_ms", IRL_STAT_INT},
 	{"low_latency_audio", IRL_STAT_BOOL},
 	{"reconnect_count", IRL_STAT_INT},
+	{"sync_enabled", IRL_STAT_BOOL},
+	{"sync_status", IRL_STAT_STRING},
+	{"sync_timecode", IRL_STAT_STRING},
+	{"sync_latency_ms", IRL_STAT_INT},
+	{"sync_latency_peak_ms", IRL_STAT_INT},
+	{"sync_added_ms", IRL_STAT_INT},
+	{"sync_error_ms", IRL_STAT_INT},
+	{"sync_required_offset_ms", IRL_STAT_INT},
 };
 
 static void stats_to_obs_data(const calldata_t *cd, obs_data_t *out)
@@ -111,6 +125,12 @@ static void stats_to_obs_data(const calldata_t *cd, obs_data_t *out)
 			bool v = false;
 			calldata_get_bool(cd, f->name, &v);
 			obs_data_set_bool(out, f->name, v);
+			break;
+		}
+		case IRL_STAT_STRING: {
+			const char *v = NULL;
+			calldata_get_string(cd, f->name, &v);
+			obs_data_set_string(out, f->name, v ? v : "");
 			break;
 		}
 		}
@@ -276,6 +296,98 @@ static void vendor_get_source_list(obs_data_t *request_data,
 	obs_data_set_bool(response_data, "success", true);
 }
 
+/* The whole sync picture in one call: what the group is configured to do,
+ * whether this machine has a clock worth trusting, and every source's status.
+ *
+ * This is the alerting path. A dock only helps when someone is looking at it,
+ * and during a live IRL show the operator may be nowhere near the machine —
+ * whereas the person who can actually fix an out-of-sync feed is the one
+ * holding the phone, and chat is how you reach them. A bot polling this can
+ * say "chase cam out of sync, needs 7.4s" where it will be seen. */
+static void vendor_get_sync_status(obs_data_t *request_data,
+				   obs_data_t *response_data, void *priv_data)
+{
+	UNUSED_PARAMETER(request_data);
+	UNUSED_PARAMETER(priv_data);
+
+	struct irl_sync_config cfg;
+	irl_sync_config_get(&cfg);
+
+	obs_data_set_bool(response_data, "sync_enabled", cfg.enabled);
+	obs_data_set_int(response_data, "offset_ms", cfg.offset_ms);
+
+	struct irl_ntp_status ntp;
+	irl_ntp_get_status(&ntp);
+
+	obs_data_t *clock = obs_data_create();
+	obs_data_set_bool(clock, "synced", ntp.synced);
+	obs_data_set_string(clock, "server", ntp.server);
+	obs_data_set_int(clock, "offset_ms", ntp.offset_ns / 1000000LL);
+	obs_data_set_int(clock, "rtt_ms", ntp.rtt_ns / 1000000LL);
+	obs_data_set_int(clock, "age_ms", (long long)(ntp.age_ns / 1000000ULL));
+
+	int64_t utc_ns = 0;
+	if (irl_ntp_utc_now_ns(&utc_ns))
+		obs_data_set_int(clock, "utc_ms", utc_ns / 1000000LL);
+	obs_data_set_obj(response_data, "clock", clock);
+	obs_data_release(clock);
+
+	struct irl_sync_entry entries[IRL_SYNC_MAX_SOURCES];
+	size_t count = irl_sync_collect(entries, IRL_ARRAY_SIZE(entries));
+
+	obs_data_array_t *array = obs_data_array_create();
+	int64_t worst_required_ms = 0;
+	int out_of_sync = 0;
+
+	for (size_t i = 0; i < count; i++) {
+		const struct irl_sync_entry *e = &entries[i];
+		obs_data_t *item = obs_data_create();
+
+		obs_data_set_string(item, "source_name", e->source_name);
+		obs_data_set_bool(item, "sync_enabled", e->sync_enabled);
+		obs_data_set_string(item, "status",
+				    irl_sync_status_name(e->snap.status));
+		obs_data_set_int(item, "latency_ms", e->snap.latency_ms);
+		obs_data_set_int(item, "latency_peak_ms",
+				 e->snap.latency_peak_ms);
+		obs_data_set_int(item, "added_ms", e->snap.added_ms);
+		obs_data_set_int(item, "error_ms", e->snap.error_ms);
+		obs_data_set_int(item, "required_offset_ms",
+				 e->snap.required_offset_ms);
+
+		if (e->snap.have_timecode) {
+			char tc[24];
+			snprintf(tc, sizeof(tc), "%02u:%02u:%02u:%02u",
+				 e->snap.tc.hours, e->snap.tc.minutes,
+				 e->snap.tc.seconds,
+				 (unsigned)e->snap.tc.n_frames);
+			obs_data_set_string(item, "timecode", tc);
+		} else {
+			obs_data_set_string(item, "timecode", "");
+		}
+
+		if (e->sync_enabled &&
+		    e->snap.required_offset_ms > worst_required_ms)
+			worst_required_ms = e->snap.required_offset_ms;
+		if (e->snap.status == IRL_SYNC_TOO_SLOW ||
+		    e->snap.status == IRL_SYNC_STALE)
+			out_of_sync++;
+
+		obs_data_array_push_back(array, item);
+		obs_data_release(item);
+	}
+
+	obs_data_set_array(response_data, "sources", array);
+	obs_data_array_release(array);
+
+	/* Pre-computed so a bot does not have to reimplement the policy: the
+	 * count worth alerting on, and the offset that would clear it. */
+	obs_data_set_int(response_data, "out_of_sync_count", out_of_sync);
+	obs_data_set_int(response_data, "recommended_offset_ms",
+			 worst_required_ms);
+	obs_data_set_bool(response_data, "success", true);
+}
+
 static void vendor_get_version(obs_data_t *request_data,
 			       obs_data_t *response_data, void *priv_data)
 {
@@ -299,6 +411,7 @@ static const struct {
 } irl_vendor_requests[] = {
 	{"GetStats", vendor_get_stats},
 	{"GetSourceList", vendor_get_source_list},
+	{"GetSyncStatus", vendor_get_sync_status},
 	{"GetVersion", vendor_get_version},
 };
 

@@ -87,8 +87,9 @@ A source you just added sizes itself to the canvas when its first frame arrives,
 | Low Latency Audio | Off | Play audio the moment it arrives, with no cushion. Lowest delay, least tolerant of a wobbly connection |
 | Show Nothing When the Stream Ends | On | Blank the source as soon as the stream drops, instead of leaving the last frame frozen on screen until it reconnects. Same idea as the media source's "Show nothing when playback ends" |
 | Close Stream When Inactive | Off | Stop pulling the stream when the source is neither showing nor active (the last frame goes black if Show Nothing When the Stream Ends is on), and reconnect when it becomes visible again |
+| Sync | Off | Include this feed in timecode sync. See [Timecode sync](#timecode-sync) — the offset and the master switch live in the IRL Sync dock, because they are one setting every source has to agree on |
 
-Target Buffer, Reconnect Delay, Adaptive Latency Control, Wait for Keyframe, Show Nothing When the Stream Ends and Close Stream When Inactive can be changed while the stream is running. The connection stays up and the stats counters keep counting. The one exception is turning Close Stream When Inactive on while the source is already hidden, which is a request to stop receiving: that drops the connection and resets the stats counters, as it would on any later hide. Changing Target Buffer mid-stream keeps every buffered sample and walks the latency to the new value at up to +5% or -2% speed, so you should not hear a seam. Changing URL, FFmpeg Options, Hardware Decode or Low Latency Audio reconnects, because those are set when the stream is opened.
+Target Buffer, Reconnect Delay, Adaptive Latency Control, Wait for Keyframe, Sync, Show Nothing When the Stream Ends and Close Stream When Inactive can be changed while the stream is running. The connection stays up and the stats counters keep counting. The one exception is turning Close Stream When Inactive on while the source is already hidden, which is a request to stop receiving: that drops the connection and resets the stats counters, as it would on any later hide. Changing Target Buffer mid-stream keeps every buffered sample and walks the latency to the new value at up to +5% or -2% speed, so you should not hear a seam. Changing URL, FFmpeg Options, Hardware Decode or Low Latency Audio reconnects, because those are set when the stream is opened.
 
 Earlier versions exposed Min/Max Buffer, PTS gap thresholds, Network Buffer and Decoupled Audio. Those are now fixed or derived internally, so old scene collections keep working and ignore the stored values.
 
@@ -98,6 +99,111 @@ Earlier versions exposed Min/Max Buffer, PTS gap thresholds, Network Buffer and 
 
 - Buffered mode is the default and the one to use for IRL. It keeps the cushion you asked for, plays at normal speed almost all the time, and covers dropouts with shaped silence instead of noise. Backlog from a stall gets played back sped up, never thrown away.
 - Low latency mode plays audio as soon as it shows up and turns off the plugin's own correction. Use it when absolute delay matters more than surviving a rough connection.
+
+## Timecode sync
+
+Multiple feeds — a main camera and a chase camera, say — arrive over different
+uplinks with different delays, so cutting between them jumps backwards and
+forwards in time. Timecode sync fixes that: each feed is held until the moment
+it was *captured*, plus a shared offset, so every synced feed shows the same
+instant at the same instant.
+
+The alignment is absolute, not relative. Feeds never negotiate with each other
+and none of them needs to know the others exist — they simply all present the
+frame captured at time T at time T + offset. Two OBS instances anywhere, on the
+same NTP reference and the same offset, therefore show the same moment at the
+same moment. That is what makes the offset one shared number rather than a
+per-source setting, and it is why co-streamers only have to agree on two things:
+the NTP pool and the offset.
+
+### What you need
+
+Sync reads SEI timecodes embedded by the sender, so the sender has to put them
+there. Today that means **Moblin**:
+
+- Settings → Streams → *(your stream)* → Video → **Timecodes**, with an **NTP
+  pool** configured (Moblin will not stamp anything without one).
+- **H.265/HEVC** only, over **SRT, SRTLA or RIST**. Moblin's H.264 path is
+  disabled in its own source, and its RTMP path never carries the timecode.
+
+Then, in OBS: tick **Sync** on each source, open **View → Docks → IRL Sync**,
+set the same NTP pool, pick an offset, and switch it on.
+
+### Choosing an offset
+
+The offset must be larger than the feed's real arrival latency, or its frames
+are already past their slot when they get here. The dock shows, per source:
+
+- **Latency** — how stale the freshest data is. A property of the sender and
+  the network; nothing you set changes it.
+- **Peak 60s** — the rolling maximum. This is what to pick an offset against.
+  Bonded cellular does not degrade gently, and an offset chosen against the
+  instantaneous value will hold right up until the first bitrate dip.
+- **Added** — how much extra hold the plugin is applying to reach the target.
+- **Error** — how far the actual presentation lands from the target. Near zero
+  once locked.
+
+**Auto** sets the offset from the worst synced feed's peak plus margin. A feed
+that cannot reach the offset turns red and says the value that would fix it, so
+you can either raise the offset yourself or pass the number to whoever is
+holding the phone.
+
+Raising the offset raises latency for everyone, so it is a real cost — sync
+means every feed waits for the slowest one.
+
+### What the statuses mean
+
+| Status | Meaning |
+|---|---|
+| **Locked** | Aligned, within a frame or two |
+| **Acquiring** | Converging. Normal at startup and after an offset change |
+| **Too slow** | The feed arrives later than the offset. Raise the offset, or improve that uplink |
+| **No timecode** | Nothing to align against: the sender is not stamping (H.264, RTMP, Timecodes off, or no NTP pool set on the device), or this machine has no NTP reference. Not a sync failure — the offset will not help |
+| **No data** | The feed stopped delivering |
+| **Off** | Sync is off, or this source is not ticked |
+
+"No timecode" is by far the most common reason sync appears not to work, and it
+is always a sender-side configuration problem.
+
+### Accuracy, and what it is not
+
+Expect **within one or two frames**. The error budget is NTP discipline at both
+ends (a few ms each), the timecode's own one-frame resolution, and OBS's render
+tick. That is well inside what anyone notices between camera angles.
+
+Sync holds at the point of composition, not at the viewer. Two OBS instances
+will composite the same captured moment at the same time, but their outbound
+encode and CDN paths still differ, so a viewer watching two *streams* side by
+side sees them offset by that difference. No plugin can control it.
+
+### How it works
+
+Each synced source holds encoded packets in front of its decoder until they are
+due. Holding compressed data is what makes a multi-second offset practical:
+five seconds of a 6 Mbit/s feed is under 4 MB, while the same five seconds of
+decoded 1080p60 would be several gigabytes.
+
+Nothing about the audio pipeline changes. Delaying the input shifts the whole
+PTS-to-OBS mapping with it, so the jitter buffer, the adaptive speed controller
+and the video pacing keep doing exactly what they did — they just see the stream
+arrive later. Drift is corrected by moving the hold slowly enough that the
+existing speed correction absorbs it inaudibly.
+
+The plugin runs its own SNTP client rather than trusting the system clock,
+which on Windows defaults to roughly one-second accuracy — two orders of
+magnitude too coarse for this. Moblin does the same on its end, for the same
+reason.
+
+That client only runs while sync is switched on. With sync off the plugin sends
+no NTP traffic at all, so installing it does not start background requests to a
+third-party pool on behalf of someone who never uses the feature. The cost is a
+few seconds between enabling sync and the first clock reference landing, which
+the dock shows as `idle` and then `not synced` until it does.
+
+The master switch, the offset and the NTP server are stored per machine (in the
+plugin's own config), not in the scene collection. A scene collection copied to
+another machine brings its sources but not its offset, which is intended: the
+offset describes an agreement between people, not a layout.
 
 ## Stats overlay
 
@@ -173,7 +279,20 @@ Vendor name: `obs-irl-source`.
 |---|---|---|
 | `GetStats` | `source_name`, optional when the scene collection has exactly one IRL source | `source_name` plus every field in [Stats reference](#stats-reference) |
 | `GetSourceList` | none | `sources`: array of `{source_name, active, showing}` |
+| `GetSyncStatus` | none | `sync_enabled`, `offset_ms`, `clock`, `sources`, `out_of_sync_count`, `recommended_offset_ms` |
 | `GetVersion` | none | `plugin_version`, `vendor_api_version`, `obs_websocket_api_version` |
+
+`GetSyncStatus` is the alerting path for [timecode sync](#timecode-sync). A dock
+only helps when somebody is looking at it, and during a live show the person who
+can actually fix an out-of-sync feed is the one out in the field — so a bot
+polling this can put "chase cam out of sync, needs 7.4s" in chat, where it will
+be seen. `out_of_sync_count` and `recommended_offset_ms` are pre-computed so a
+bot does not have to reimplement the policy. `clock` reports the NTP reference
+as `{synced, server, offset_ms, rtt_ms, age_ms, utc_ms}`; a large `age_ms` means
+the reference has gone stale and everything downstream of it is suspect. Each
+entry in `sources` carries `source_name`, `sync_enabled`, `status`, `timecode`,
+`latency_ms`, `latency_peak_ms`, `added_ms`, `error_ms` and
+`required_offset_ms`.
 
 Every response carries `success`. When it is `false`, `error` says why: no source by that name, that source is not an IRL Source, no IRL Source at all, or more than one with no `source_name` given. Stream URLs are deliberately not exposed, because they can carry an SRT passphrase or a stream key and every connected client would see them.
 
@@ -363,6 +482,14 @@ Stats are exposed through OBS's `proc_handler` API under the `get_stats` call, a
 | `stream_delay_ms` | int | End-to-end stream delay (SRT latency + decode + buffering) |
 | `low_latency_audio` | bool | Whether OBS async unbuffered low-latency mode is enabled |
 | `reconnect_count` | int | Number of reconnect attempts since the source was created |
+| `sync_enabled` | bool | Whether this source is ticked for [timecode sync](#timecode-sync) |
+| `sync_status` | string | `off`, `no_timecode`, `stale`, `too_slow`, `acquiring` or `locked` |
+| `sync_timecode` | string | Most recent timecode from the sender, `HH:MM:SS:FF`, empty when none |
+| `sync_latency_ms` | int | How stale the freshest received frame is, from its timecode against NTP |
+| `sync_latency_peak_ms` | int | Rolling 60s maximum of the above. Pick an offset against this, not the instantaneous value |
+| `sync_added_ms` | int | Extra hold currently applied to reach the target presentation time |
+| `sync_error_ms` | int | How far the actual presentation lands from the target. Near zero when locked |
+| `sync_required_offset_ms` | int | Smallest offset at which this source could hold sync |
 
 ### OBS log stats
 
@@ -382,11 +509,18 @@ The plugin statically links its own FFmpeg, libsrt, librist and mbedTLS rather t
 
 ```bash
 sudo apt install build-essential cmake pkg-config nasm meson ninja-build \
-    libobs-dev libva-dev
+    libobs-dev libva-dev qt6-base-dev
 ./deps/build-deps.sh
 cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build --parallel
 ```
+
+`qt6-base-dev` builds the IRL Sync dock, and it is the only thing in the plugin
+that needs Qt. Without it the build still succeeds and configure says so — sync
+itself runs headless and its status stays readable over the obs-websocket
+vendor, you just get no dock. `-DIRL_ENABLE_DOCK=OFF` skips it deliberately.
+On Windows and macOS, Qt6 comes from the `*-deps-qt6-*` archives in the same
+obs-deps release used for libobs; point `CMAKE_PREFIX_PATH` at it.
 
 ### Windows (MSVC)
 

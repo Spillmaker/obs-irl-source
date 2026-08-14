@@ -282,18 +282,68 @@ set(PLUGIN_SOURCES
     src/receiver-audio.c
     src/receiver-decode.c
     src/receiver-stream.c
+    src/receiver-sync.c
     src/receiver-video.c
     src/audio-buffer.c
+    src/ntp-client.c
+    src/sei-timecode.c
+    src/sync-group.c
     src/video-handler.c
     src/pts-repair.c
     src/settings.c
     src/websocket-vendor.c
 )
 
+# ── Sync dock (optional) ─────────────────────────────────────
+#
+# The dock is the only part of the plugin that needs Qt, and the only C++.
+# It is optional so a build without Qt still produces a working plugin: sync
+# itself runs headless, and its status stays reachable over the obs-websocket
+# vendor. obs-frontend-api is deliberately not linked — sync-dock.cpp resolves
+# the two symbols it needs at runtime, which keeps the CI's libobs-only OBS
+# build from having to grow the whole Qt frontend.
+option(IRL_ENABLE_DOCK "Build the IRL Sync dock (requires Qt6 Widgets)" ON)
+
+set(_IRL_DOCK OFF)
+if(IRL_ENABLE_DOCK)
+    # CXX has to be live before find_package(Qt6): Qt's own config module runs
+    # check_cxx_source_compiles() while resolving its dependencies, which is a
+    # hard error in a C-only project. Probed rather than enabled outright so a
+    # toolchain without a C++ compiler still configures — it just loses the
+    # dock, same as a machine without Qt.
+    include(CheckLanguage)
+    check_language(CXX)
+    if(CMAKE_CXX_COMPILER)
+        enable_language(CXX)
+        find_package(Qt6 QUIET COMPONENTS Widgets)
+    endif()
+
+    if(Qt6_FOUND)
+        set(_IRL_DOCK ON)
+        list(APPEND PLUGIN_SOURCES src/sync-dock.cpp)
+    else()
+        message(STATUS
+            "Qt6 Widgets not found; building without the IRL Sync dock. "
+            "Sync still works and is readable over obs-websocket.")
+    endif()
+endif()
+
 add_library(obs-irl-source MODULE ${PLUGIN_SOURCES})
 target_compile_definitions(obs-irl-source PRIVATE
     OBS_IRL_SOURCE_VERSION="${OBS_IRL_SOURCE_BUILD_VERSION}"
 )
+
+if(_IRL_DOCK)
+    set_target_properties(obs-irl-source PROPERTIES AUTOMOC ON)
+    target_compile_definitions(obs-irl-source PRIVATE IRL_ENABLE_DOCK)
+    target_compile_features(obs-irl-source PRIVATE cxx_std_17)
+    target_link_libraries(obs-irl-source PRIVATE Qt6::Widgets)
+    # dlsym() for the obs-frontend-api entry points. Empty on platforms that
+    # keep it in libc, and unused on Windows (GetProcAddress).
+    if(NOT WIN32)
+        target_link_libraries(obs-irl-source PRIVATE ${CMAKE_DL_LIBS})
+    endif()
+endif()
 
 # ── Include directories ──────────────────────────────────────
 target_include_directories(obs-irl-source PRIVATE
@@ -363,6 +413,7 @@ endif()
 if(_IRL_BUNDLED)
     set_target_properties(obs-irl-source PROPERTIES
         C_VISIBILITY_PRESET hidden
+        CXX_VISIBILITY_PRESET hidden
         VISIBILITY_INLINES_HIDDEN ON
     )
     if(APPLE)
@@ -403,8 +454,14 @@ if(MSVC)
     set_target_properties(obs-irl-source PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS OFF)
 else()
     target_compile_options(obs-irl-source PRIVATE
-        -Wall -Wextra -Wpedantic
+        -Wall -Wextra
         -Wno-unused-parameter
+    )
+    # C only: libobs's own headers use anonymous structs, which ISO C++
+    # prohibits, so -Wpedantic on the dock's translation unit reports nothing
+    # but noise from headers we do not own.
+    target_compile_options(obs-irl-source PRIVATE
+        $<$<COMPILE_LANGUAGE:C>:-Wpedantic>
     )
 endif()
 
@@ -459,6 +516,11 @@ elseif(LIBAV_FOUND)
     message(STATUS "  FFmpeg:    pkg-config (${LIBAV_VERSION}) — host-provided")
 else()
     message(STATUS "  FFmpeg:    manual (${FFMPEG_DIR}) — host-provided")
+endif()
+if(_IRL_DOCK)
+    message(STATUS "  Sync dock: Qt ${Qt6_VERSION}")
+else()
+    message(STATUS "  Sync dock: disabled (no Qt6)")
 endif()
 message(STATUS "  Install:   ${OBS_PLUGIN_DIR}")
 message(STATUS "")

@@ -35,6 +35,8 @@ void irl_source_get_defaults(obs_data_t *settings)
 				  IRL_DEFAULT_CLOSE_WHEN_INACTIVE);
 	obs_data_set_default_bool(settings, "clear_on_disconnect",
 				  IRL_DEFAULT_CLEAR_ON_DISCONNECT);
+	obs_data_set_default_bool(settings, "sync_enabled",
+				  IRL_DEFAULT_SYNC_ENABLED);
 }
 
 /* ── Properties ───────────────────────────────────────────── */
@@ -74,6 +76,26 @@ obs_properties_t *irl_source_get_properties(void *data)
 			"backlog from a stall is played back slightly sped up "
 			"instead of skipped. Lower values reduce delay but "
 			"make silence or hitches more likely on bad signal."),
+		OBS_TEXT_INFO);
+
+	/* ── Timecode Sync ─────────────────────────────────── */
+
+	obs_properties_add_bool(props, "sync_enabled",
+				obs_module_text("Sync"));
+	obs_properties_add_text(
+		props, "sync_help",
+		obs_module_text(
+			"Sync keeps this feed aligned with every other synced "
+			"feed by presenting each frame at the wall-clock time it "
+			"was captured, plus a shared offset. The master switch, "
+			"the offset and the NTP server live in the IRL Sync dock "
+			"(View > Docks), because they are one setting that every "
+			"source and every OBS instance has to agree on.\n\n"
+			"Requires the sender to embed SEI timecodes: in Moblin "
+			"that is Settings > Streams > (stream) > Video > "
+			"Timecodes, with an NTP pool set, and it only reaches "
+			"the wire on H.265/HEVC over SRT, SRTLA or RIST. The "
+			"dock reports \"No timecode\" when nothing arrives."),
 		OBS_TEXT_INFO);
 
 	/* ── Advanced ──────────────────────────────────────── */

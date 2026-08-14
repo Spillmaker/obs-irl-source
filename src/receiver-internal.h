@@ -25,3 +25,21 @@ void irl_video_queue_push(struct irl_source *ctx, AVFrame *frame,
 void irl_video_request_clear(struct irl_source *ctx);
 void *irl_video_thread(void *data);
 void irl_log_receiver_stats(struct irl_source *ctx);
+
+/* Route one packet to its decoder. Shared by the read loop and the sync
+ * delay line, which releases held packets down the same path. */
+void irl_dispatch_packet(struct irl_source *ctx, AVPacket *pkt, AVFrame *frame);
+
+/* ── Timecode sync (receiver-sync.c) ──────────────────────── */
+
+/* Fold a freshly read packet into the sync controller: extract its timecode
+ * if it has one, measure, and move the hold. */
+void irl_sync_observe(struct irl_source *ctx, const AVPacket *pkt);
+/* True when the packet was taken by the delay line and must not be dispatched
+ * by the caller. */
+bool irl_sync_hold(struct irl_source *ctx, AVPacket *pkt);
+/* Release everything whose moment has come. */
+void irl_sync_drain(struct irl_source *ctx, AVFrame *frame);
+bool irl_sync_delay_full(const struct irl_source *ctx);
+void irl_sync_reset(struct irl_source *ctx);
+void irl_sync_free(struct irl_source *ctx);

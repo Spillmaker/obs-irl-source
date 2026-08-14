@@ -9,7 +9,9 @@
  */
 
 #include <obs-module.h>
+#include "../include/irl-ntp.h"
 #include "../include/irl-source.h"
+#include "../include/irl-sync.h"
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("obs-irl-source", "en-US")
@@ -39,15 +41,24 @@ static struct obs_source_info irl_source_info = {
 bool obs_module_load(void)
 {
 	obs_register_source(&irl_source_info);
+
+	/* Ordering: the NTP client has to exist before the sync settings are
+	 * loaded, because loading them applies the configured server to it. */
+	irl_ntp_start();
+	irl_sync_init();
 	return true;
 }
 
 /* Runs after every module's obs_module_load(), which is the only point at
  * which obs-websocket is guaranteed to have published its API. See
- * websocket-vendor.c. */
+ * websocket-vendor.c. The dock goes here for a different reason: the frontend
+ * is only guaranteed to exist once module loading has finished. */
 void obs_module_post_load(void)
 {
 	irl_websocket_vendor_register();
+#ifdef IRL_ENABLE_DOCK
+	irl_sync_dock_register();
+#endif
 }
 
 const char *obs_module_description(void)
@@ -63,5 +74,9 @@ const char *obs_module_author(void)
 
 void obs_module_unload(void)
 {
-	/* nothing to clean up globally */
+#ifdef IRL_ENABLE_DOCK
+	irl_sync_dock_unregister();
+#endif
+	irl_ntp_stop();
+	irl_sync_shutdown();
 }
