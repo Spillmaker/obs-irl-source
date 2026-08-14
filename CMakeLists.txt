@@ -30,10 +30,22 @@ if(Git_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
     endif()
 endif()
 
-if(DEFINED OBS_SOURCE_DIR AND EXISTS "${OBS_SOURCE_DIR}/cmake/finders")
+# Normalise to forward slashes before this is used anywhere.
+#
+# Windows callers pass -DOBS_SOURCE_DIR=%CD%\obs-src, and CMake writes
+# CMAKE_MODULE_PATH verbatim into the CMakeLists it generates for
+# try_compile(), where CMake 4.x rejects `\a` as an invalid character escape.
+# Any find_package that probes by compiling then fails to configure — which is
+# exactly what Qt6 does, via FindThreads. Forward slashes are accepted
+# everywhere, so converting once here covers every use below.
+if(DEFINED OBS_SOURCE_DIR)
+    file(TO_CMAKE_PATH "${OBS_SOURCE_DIR}" OBS_SOURCE_DIR)
+elseif(DEFINED ENV{OBS_SOURCE_DIR})
+    file(TO_CMAKE_PATH "$ENV{OBS_SOURCE_DIR}" OBS_SOURCE_DIR)
+endif()
+
+if(OBS_SOURCE_DIR AND EXISTS "${OBS_SOURCE_DIR}/cmake/finders")
     list(APPEND CMAKE_MODULE_PATH "${OBS_SOURCE_DIR}/cmake/finders")
-elseif(DEFINED ENV{OBS_SOURCE_DIR} AND EXISTS "$ENV{OBS_SOURCE_DIR}/cmake/finders")
-    list(APPEND CMAKE_MODULE_PATH "$ENV{OBS_SOURCE_DIR}/cmake/finders")
 endif()
 
 # ── Find OBS ─────────────────────────────────────────────────
@@ -47,11 +59,7 @@ if(libobs_FOUND)
 else()
     set(_OBS_USE_FIND_PACKAGE OFF)
 
-    # Fall back to manual OBS_SOURCE_DIR approach.
-    if(NOT DEFINED OBS_SOURCE_DIR AND DEFINED ENV{OBS_SOURCE_DIR})
-        set(OBS_SOURCE_DIR "$ENV{OBS_SOURCE_DIR}")
-    endif()
-
+    # Fall back to the manual OBS_SOURCE_DIR approach.
     set(_OBS_INCLUDE_DIRS "")
     set(_OBS_LIB_DIRS "")
 
