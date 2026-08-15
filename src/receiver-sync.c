@@ -309,6 +309,194 @@ static void set_tc_reason(struct irl_source *ctx, enum irl_sync_tc_reason reason
 	}
 }
 
+/* ── Frame rate ───────────────────────────────────────────── */
+
+/* The frame rate is a property of the stream, and every source can be running
+ * a different one — 25, 30, 50, 60, 240 — so it is learned, never assumed.
+ *
+ * It is learned from the timecodes rather than from the decoder, for two
+ * reasons. The signal is the same one being converted: n_frames is an index
+ * within its timecode second (H.265 D.2.27), so the highest index a second
+ * carries is that second's frame count, and using it to convert n_frames back
+ * to time is self-consistent by construction. And it is available on the
+ * receiver thread, at the first complete second, where the decoder's own
+ * measurement is both cross-thread and only written once frames are coming out
+ * the far side of the keyframe gate.
+ *
+ * A maximum, not a count of stamps seen, so lost packets can only make the
+ * estimate arrive later — never make it wrong in a way that would be silently
+ * folded into every latency measurement afterwards.
+ */
+static void tc_rate_record(struct irl_source *ctx, uint16_t max_frames)
+{
+	ctx->sync_fps_recent[ctx->sync_fps_next] = max_frames;
+	ctx->sync_fps_next = (ctx->sync_fps_next + 1) % IRL_SYNC_FPS_SECONDS;
+	if (ctx->sync_fps_count < IRL_SYNC_FPS_SECONDS)
+		ctx->sync_fps_count++;
+
+	/* Two seconds before committing to a figure. One second that happened
+	 * to lose its last few packets reads as a lower rate, and because the
+	 * first measurement is what seeds the hold at engage, adopting it
+	 * would bake that in. A second second costs a second of acquire time
+	 * and makes a short read merely late instead of wrong. */
+	if (ctx->sync_fps_count < 2)
+		return;
+
+	uint16_t highest = 0;
+	for (int i = 0; i < ctx->sync_fps_count; i++) {
+		if (ctx->sync_fps_recent[i] > highest)
+			highest = ctx->sync_fps_recent[i];
+	}
+
+	/* Indices are zero-based, so the count is one more than the highest. */
+	int64_t interval_ns = 1000000000LL / ((int64_t)highest + 1);
+
+	/* Outside what any real stream runs at: a corrupt SEI, or a sender
+	 * counting something other than frames. Keep whatever was already
+	 * learned rather than adopting a figure that would bias every
+	 * conversion after it. */
+	if (interval_ns < IRL_VIDEO_INTERVAL_MIN_NS ||
+	    interval_ns > IRL_VIDEO_INTERVAL_MAX_NS)
+		return;
+
+	if (ctx->sync_fps_interval_ns != interval_ns) {
+		ctx->sync_fps_interval_ns = interval_ns;
+		blog(LOG_INFO,
+		     "[irl-source] Sync: sender is stamping %d frames per second",
+		     (int)highest + 1);
+	}
+}
+
+static void tc_rate_observe(struct irl_source *ctx,
+			    const struct irl_timecode *tc)
+{
+	if (ctx->sync_tc_have_second && tc->seconds == ctx->sync_tc_second) {
+		if (tc->n_frames > ctx->sync_tc_max_frames)
+			ctx->sync_tc_max_frames = tc->n_frames;
+		return;
+	}
+
+	/* A second just ended, so its highest index is one full frame count.
+	 *
+	 * The second the stream was joined partway into counts the same as any
+	 * other: frame indices ascend within a second, so joining late still
+	 * observes that second's tail, which is where its maximum is. Only
+	 * lost packets can shorten a second, and the rolling maximum over
+	 * IRL_SYNC_FPS_SECONDS is what covers that. */
+	if (ctx->sync_tc_have_second)
+		tc_rate_record(ctx, ctx->sync_tc_max_frames);
+
+	ctx->sync_tc_second = tc->seconds;
+	ctx->sync_tc_max_frames = tc->n_frames;
+	ctx->sync_tc_have_second = true;
+}
+
+/* The interval to convert n_frames with, or false if nothing has measured one
+ * yet. There is deliberately no default: an assumed rate would put
+ * n_frames x (assumed - actual) of error into every latency reading, which at
+ * the top of the range is seconds, and would then be seeded into the hold and
+ * held in the latency peak long after the real rate was known. */
+static bool tc_frame_interval_ns(struct irl_source *ctx, int64_t *interval_ns)
+{
+	if (ctx->sync_fps_interval_ns > 0) {
+		*interval_ns = ctx->sync_fps_interval_ns;
+		return true;
+	}
+
+	/* Before the first complete second, the decoder's cadence will do if
+	 * it has one — also measured, just from the other side of the pipe. */
+	irl_mutex_lock(&ctx->audio_state_lock);
+	int64_t decoded_ns = ctx->video_frame_interval_ns;
+	irl_mutex_unlock(&ctx->audio_state_lock);
+
+	if (decoded_ns >= IRL_VIDEO_INTERVAL_MIN_NS &&
+	    decoded_ns <= IRL_VIDEO_INTERVAL_MAX_NS) {
+		*interval_ns = decoded_ns;
+		return true;
+	}
+
+	return false;
+}
+
+/* ── Error filter ─────────────────────────────────────────── */
+
+static int cmp_int64(const void *a, const void *b)
+{
+	int64_t x = *(const int64_t *)a;
+	int64_t y = *(const int64_t *)b;
+	return (x > y) - (x < y);
+}
+
+static void error_filter_reset(struct irl_source *ctx)
+{
+	ctx->sync_error_head = 0;
+	ctx->sync_error_count = 0;
+}
+
+/* Fold one presentation-error reading in and return the window median.
+ *
+ * The per-packet reading carries about a frame of noise: it is the *predicted*
+ * presentation time of one access unit, taken from an audio playout mapping
+ * that steps as audio is submitted, against a capture timecode the sender can
+ * only express to frame resolution. That noise is zero-mean and the true error
+ * moves far slower, so filtering costs nothing real and buys two things.
+ *
+ * The loop corrects once per settle interval, on whatever single reading
+ * happened to be current when the gate opened — so an unfiltered sample put a
+ * frame of dither straight into the actuator, every time. And the number the
+ * operator reads jittered by a frame while the alignment underneath it was
+ * steady, which is not what a sync readout is for.
+ *
+ * Median rather than mean: a corrupt or mis-stamped timecode produces one
+ * wildly wrong sample, and the median ignores it outright where a mean would
+ * spread it across the whole window.
+ *
+ * The window is bounded by time, not by sample count, so the filter behaves
+ * identically on a 25fps feed and a 240fps one. See IRL_SYNC_ERROR_WINDOW_NS. */
+static int64_t error_filter_push(struct irl_source *ctx, int64_t error_ns,
+				 uint64_t now_ns)
+{
+	if (ctx->sync_error_count == IRL_SYNC_ERROR_SAMPLES) {
+		/* Full before the window expired: a rate above what the
+		 * interval bounds accept, or timecodes on every field of an
+		 * interlaced feed. Dropping the oldest keeps it a median of
+		 * the most recent second's worth either way. */
+		ctx->sync_error_head =
+			(ctx->sync_error_head + 1) % IRL_SYNC_ERROR_SAMPLES;
+		ctx->sync_error_count--;
+	}
+
+	int tail = (ctx->sync_error_head + ctx->sync_error_count) %
+		   IRL_SYNC_ERROR_SAMPLES;
+	ctx->sync_error_window[tail] = error_ns;
+	ctx->sync_error_time[tail] = now_ns;
+	ctx->sync_error_count++;
+
+	/* Age out anything past the window. Never empties: the sample just
+	 * pushed is by definition current. */
+	while (ctx->sync_error_count > 1 &&
+	       now_ns - ctx->sync_error_time[ctx->sync_error_head] >
+		       IRL_SYNC_ERROR_WINDOW_NS) {
+		ctx->sync_error_head =
+			(ctx->sync_error_head + 1) % IRL_SYNC_ERROR_SAMPLES;
+		ctx->sync_error_count--;
+	}
+
+	int64_t sorted[IRL_SYNC_ERROR_SAMPLES];
+	for (int i = 0; i < ctx->sync_error_count; i++) {
+		sorted[i] = ctx->sync_error_window[(ctx->sync_error_head + i) %
+						   IRL_SYNC_ERROR_SAMPLES];
+	}
+	qsort(sorted, (size_t)ctx->sync_error_count, sizeof(sorted[0]),
+	      cmp_int64);
+
+	/* Lower median on an even count. The half-sample of bias that costs is
+	 * far below the noise this exists to remove, and it avoids averaging
+	 * the two middle samples — which would reintroduce a mean, and with it
+	 * the outlier sensitivity the median is here to avoid. */
+	return sorted[ctx->sync_error_count / 2];
+}
+
 /* The smallest offset the control can be set to that still clears `peak_ms`.
  * See irl_sync_snapshot.required_offset_ms. */
 static int64_t required_offset_ms(int64_t peak_ms)
@@ -352,6 +540,13 @@ void irl_sync_reset(struct irl_source *ctx)
 	ctx->sync_hold_ns = 0;
 	ctx->sync_latency_ns = 0;
 	ctx->sync_error_ns = 0;
+	error_filter_reset(ctx);
+	ctx->sync_fps_interval_ns = 0;
+	ctx->sync_fps_next = 0;
+	ctx->sync_fps_count = 0;
+	ctx->sync_tc_max_frames = 0;
+	ctx->sync_tc_second = 0;
+	ctx->sync_tc_have_second = false;
 	ctx->sync_last_tc_ns = 0;
 	ctx->sync_last_adjust_ns = 0;
 	ctx->sync_settle_until_ns = 0;
@@ -455,12 +650,23 @@ static void update_status(struct irl_source *ctx, uint64_t now_ns,
 static void observe_timecode(struct irl_source *ctx, const AVPacket *pkt,
 			     const struct irl_timecode *tc, uint64_t now_ns)
 {
-	irl_mutex_lock(&ctx->audio_state_lock);
-	int64_t frame_interval_ns = ctx->video_frame_interval_ns;
-	irl_mutex_unlock(&ctx->audio_state_lock);
-	if (frame_interval_ns < IRL_VIDEO_INTERVAL_MIN_NS ||
-	    frame_interval_ns > IRL_VIDEO_INTERVAL_MAX_NS)
-		frame_interval_ns = IRL_VIDEO_INTERVAL_DEFAULT_NS;
+	tc_rate_observe(ctx, tc);
+
+	int64_t frame_interval_ns;
+	if (!tc_frame_interval_ns(ctx, &frame_interval_ns)) {
+		/* Timecodes are arriving, but nothing has established the frame
+		 * rate yet, so n_frames cannot be turned into time. Normally
+		 * one timecode second. Hold the stamp for the dock and keep the
+		 * staleness clock fed, but measure nothing: a guess here would
+		 * seed the hold wrong and sit in the latency peak for a minute
+		 * afterwards. */
+		ctx->sync_tc = *tc;
+		ctx->sync_have_tc = true;
+		ctx->sync_last_tc_ns = now_ns;
+		set_tc_reason(ctx, IRL_SYNC_TC_OK);
+		ctx->sync_status = IRL_SYNC_ACQUIRING;
+		return;
+	}
 
 	int64_t latency_ns;
 	if (!timecode_latency_ns(tc, frame_interval_ns, &latency_ns)) {
@@ -506,6 +712,7 @@ static void observe_timecode(struct irl_source *ctx, const AVPacket *pkt,
 		ctx->sync_locked = false;
 		ctx->sync_applied_offset_ms = irl_sync_offset_ms();
 		ctx->sync_offset_generation = irl_sync_offset_generation();
+		error_filter_reset(ctx);
 
 		blog(LOG_INFO,
 		     "[irl-source] Sync engaged: feed latency %lldms, offset %dms, holding %lldms",
@@ -525,6 +732,10 @@ static void observe_timecode(struct irl_source *ctx, const AVPacket *pkt,
 		ctx->sync_applied_offset_ms = irl_sync_offset_ms();
 		ctx->sync_offset_generation = generation;
 		ctx->sync_locked = false;
+		/* The target just moved by seconds. Every sample in the window
+		 * describes the old one, and a median of stale readings would
+		 * hold the loop back from a change the user asked for. */
+		error_filter_reset(ctx);
 	}
 
 	int64_t pts_ns = 0;
@@ -540,7 +751,8 @@ static void observe_timecode(struct irl_source *ctx, const AVPacket *pkt,
 	    predict_presentation_ns(ctx, pts_ns, &presentation_ns)) {
 		/* Where this content should land, and where it will. */
 		int64_t target_ns = (int64_t)now_ns + needed_ns;
-		ctx->sync_error_ns = presentation_ns - target_ns;
+		ctx->sync_error_ns = error_filter_push(
+			ctx, presentation_ns - target_ns, now_ns);
 
 		/* Wait for the last correction to reach the measurement before
 		 * making another one.

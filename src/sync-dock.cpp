@@ -338,7 +338,7 @@ enum column {
 	COL_TIMECODE,
 	COL_LATENCY,
 	COL_ADDED,
-	COL_ERROR,
+	COL_DRIFT,
 	COL_STATUS,
 	COL_COUNT,
 };
@@ -522,7 +522,7 @@ private:
 		table->setHorizontalHeaderLabels(
 			{QStringLiteral("Source"), QStringLiteral("Timecode"),
 			 QStringLiteral("Latency"), QStringLiteral("Added"),
-			 QStringLiteral("Error"), QStringLiteral("Status")});
+			 QStringLiteral("Drift"), QStringLiteral("Status")});
 		table->verticalHeader()->setVisible(false);
 		table->verticalHeader()->setDefaultSectionSize(
 			QFontMetrics(font()).height() + 12);
@@ -572,7 +572,7 @@ private:
 		fix(COL_TIMECODE, TC_CHARS);
 		fix(COL_LATENCY, VALUE_CHARS);
 		fix(COL_ADDED, VALUE_CHARS);
-		fix(COL_ERROR, VALUE_CHARS);
+		fix(COL_DRIFT, VALUE_CHARS);
 
 		/* Status is prose rather than a figure, so it is sized from the
 		 * longest wording instead of a character count, and left
@@ -662,7 +662,7 @@ private:
 
 			/* The measured columns tick in place; the fixed face
 			 * keeps them from shifting under the header. */
-			if (column >= COL_TIMECODE && column <= COL_ERROR)
+			if (column >= COL_TIMECODE && column <= COL_DRIFT)
 				item->setFont(fixedFont(this));
 			table->setItem(row, column, item);
 		}
@@ -833,7 +833,7 @@ private:
 			cell(row, COL_ADDED)
 				->setText(aligning ? format_value(s.added_ms)
 						   : no_value(VALUE_CHARS));
-			cell(row, COL_ERROR)
+			cell(row, COL_DRIFT)
 				->setText(aligning ? format_value(s.error_ms)
 						   : no_value(VALUE_CHARS));
 

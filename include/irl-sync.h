@@ -56,6 +56,23 @@ struct irl_source;
  * receiver-sync.c sets the bucket duration. */
 #define IRL_SYNC_PEAK_BUCKETS 12
 
+/* How long the presentation error is median-filtered over. See
+ * error_filter_push().
+ *
+ * A duration, not a sample count, because sources run at anything from 25 to
+ * 240fps: a fixed number of samples would be a different filter on every feed,
+ * and at the low end would put seconds of lag into the control loop. The
+ * capacity is what a duration costs at the fastest rate the interval bounds
+ * accept (IRL_VIDEO_INTERVAL_MIN_NS, 250fps), so the window is time-bounded on
+ * every source rather than sample-bounded on the fast ones. */
+#define IRL_SYNC_ERROR_WINDOW_NS 1000000000ULL
+#define IRL_SYNC_ERROR_SAMPLES 256
+
+/* Completed timecode seconds the frame rate is held over. A rolling maximum,
+ * so a second that lost packets cannot drag the estimate down, and a genuine
+ * rate change still lands within this many seconds. */
+#define IRL_SYNC_FPS_SECONDS 4
+
 /* ── Per-source status ────────────────────────────────────── */
 
 enum irl_sync_status {

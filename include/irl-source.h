@@ -549,7 +549,14 @@ struct irl_source {
 	 * actuator: everything else about sync is measurement. */
 	int64_t sync_hold_ns;
 	int64_t sync_latency_ns;
+	/* Median of the readings in the window, not the last one. See
+	 * error_filter_push(). Ring, oldest at sync_error_head; the timestamps
+	 * are what bound it by time rather than by sample count. */
 	int64_t sync_error_ns;
+	int64_t sync_error_window[IRL_SYNC_ERROR_SAMPLES];
+	uint64_t sync_error_time[IRL_SYNC_ERROR_SAMPLES];
+	int sync_error_head;
+	int sync_error_count;
 	/* Offset the current hold was computed against, plus the generation
 	 * counter that says the user has changed it since. */
 	int sync_applied_offset_ms;
@@ -563,6 +570,18 @@ struct irl_source {
 	uint64_t sync_publish_ns;
 	uint64_t sync_too_slow_since_ns;
 	uint64_t sync_in_reach_since_ns;
+	/* Frame rate as learned from the timecodes themselves, so converting
+	 * n_frames to time never assumes one. See tc_rate_observe(). Zero
+	 * until a complete timecode second has been seen. */
+	int64_t sync_fps_interval_ns;
+	uint16_t sync_fps_recent[IRL_SYNC_FPS_SECONDS];
+	int sync_fps_next;
+	int sync_fps_count;
+	/* The timecode second being accumulated, and the highest frame index
+	 * seen in it so far. */
+	uint16_t sync_tc_max_frames;
+	uint8_t sync_tc_second;
+	bool sync_tc_have_second;
 	/* Rolling peak of arrival latency, bucketed so it ages out. */
 	int64_t sync_peak_buckets[IRL_SYNC_PEAK_BUCKETS];
 	int sync_peak_bucket;
