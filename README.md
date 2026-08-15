@@ -144,14 +144,16 @@ Sync ticked, and shows:
 - **Error** — how far the actual presentation lands from the target. Near zero
   once locked.
 
-Next to the offset, **min N s** is the smallest setting that clears every
-synced feed's rolling 60-second peak latency — the peak rather than the
-instantaneous value, because bonded cellular does not degrade gently and an
-offset chosen against the current reading holds right up until the first
-bitrate dip. It turns red when the offset is below it. A feed that cannot reach
-the offset turns red too and says the value that would fix it, so you can
-either raise the offset yourself or pass the number to whoever is holding the
-phone.
+Changing the offset takes effect when you press **Update**, not as you type:
+it is a several-second step for every synced feed at once, so it happens when
+you say so.
+
+A feed that cannot reach the offset turns red and says the value that would fix
+it — its rolling 60-second peak latency, rounded up to a whole second. The peak
+rather than the instantaneous value, because bonded cellular does not degrade
+gently and an offset chosen against the current reading holds right up until
+the first bitrate dip. Raise the offset to that, or pass the number to whoever
+is holding the phone.
 
 Raising the offset raises latency for everyone, so it is a real cost — sync
 means every feed waits for the slowest one.
