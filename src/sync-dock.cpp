@@ -25,16 +25,22 @@
 #include <QBrush>
 #include <QColor>
 #include <QDateTime>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QFont>
 #include <QFontDatabase>
 #include <QFontMetrics>
+#include <QFormLayout>
 #include <QFrame>
 #include <QHBoxLayout>
 #include <QHeaderView>
+#include <QIcon>
 #include <QLabel>
 #include <QLineEdit>
 #include <QPushButton>
+#include <QSize>
 #include <QSpinBox>
+#include <QStyle>
 #include <QTableWidget>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -183,8 +189,8 @@ static QString status_text(const struct irl_sync_snapshot &snap)
 	case IRL_SYNC_TOO_SLOW:
 		/* The number is the point: it tells the operator whether to
 		 * raise the offset themselves or call the person in the field. */
-		return QString("▲ Too slow · needs ≥ %1")
-			.arg(format_ms(snap.required_offset_ms));
+		return QString("▲ Too slow · needs ≥ %1 s")
+			.arg(snap.required_offset_ms / 1000);
 	case IRL_SYNC_STALE:
 		return QStringLiteral("▲ No data");
 	case IRL_SYNC_NO_TIMECODE:
@@ -233,16 +239,37 @@ static QString status_tooltip(const struct irl_sync_snapshot &snap)
 	}
 }
 
+/* Borrow OBS's own gear rather than shipping one. The frontend stylesheet
+ * attaches the artwork to these property selectors, so a button that declares
+ * them picks up whatever the running theme uses on the Controls dock — and
+ * follows the user's theme for free. The property name changed with the theme
+ * engine in OBS 30.2, so both spellings are set; a theme that honours neither
+ * leaves the icon null and gets the glyph instead. */
+static void applyGearIcon(QPushButton *button)
+{
+	button->setProperty("themeID", "configIconSmall");
+	button->setProperty("class", "icon-gear");
+	button->style()->unpolish(button);
+	button->style()->polish(button);
+
+	if (button->icon().isNull())
+		button->setText(QStringLiteral("⚙"));
+	else
+		button->setIconSize(QSize(16, 16));
+
+	button->setMaximumWidth(32);
+}
+
 /* ── Dock widget ──────────────────────────────────────────── */
 
 namespace {
 
+/* Only sources with Sync ticked are listed, so there is no column saying
+ * whether they are: every row is one. */
 enum column {
 	COL_SOURCE = 0,
-	COL_SYNC,
 	COL_TIMECODE,
 	COL_LATENCY,
-	COL_PEAK,
 	COL_ADDED,
 	COL_ERROR,
 	COL_STATUS,
@@ -269,9 +296,7 @@ private:
 	QLabel *recommendedLabel = nullptr;
 	QLabel *summaryLabel = nullptr;
 	QSpinBox *offsetSpin = nullptr;
-	QLineEdit *ntpEdit = nullptr;
 	QPushButton *masterButton = nullptr;
-	QPushButton *autoButton = nullptr;
 	QTableWidget *table = nullptr;
 
 	int ticks = 0;
@@ -361,12 +386,14 @@ private:
 
 		row->addWidget(new QLabel(QStringLiteral("Offset"), this));
 
+		/* Whole seconds. See IRL_SYNC_OFFSET_STEP_MS: this is the
+		 * number co-streamers agree on out loud, so the control offers
+		 * exactly the values that are worth saying. */
 		offsetSpin = new QSpinBox(this);
-		offsetSpin->setRange(IRL_SYNC_MIN_OFFSET_MS,
-				     IRL_SYNC_MAX_OFFSET_MS);
-		offsetSpin->setSingleStep(250);
-		offsetSpin->setSuffix(QStringLiteral(" ms"));
-		offsetSpin->setValue(irl_sync_offset_ms());
+		offsetSpin->setRange(IRL_SYNC_MIN_OFFSET_MS / 1000,
+				     IRL_SYNC_MAX_OFFSET_MS / 1000);
+		offsetSpin->setSuffix(QStringLiteral(" s"));
+		offsetSpin->setValue(irl_sync_offset_ms() / 1000);
 		offsetSpin->setFont(fixedFont(this));
 		/* Named on the declaring class: editingFinished and clicked
 		 * are inherited, and spelling the base out keeps the
@@ -375,46 +402,21 @@ private:
 				 &QAbstractSpinBox::editingFinished, this,
 				 [this]() {
 					 irl_sync_set_offset_ms(
-						 offsetSpin->value());
+						 offsetSpin->value() * 1000);
 				 });
 		row->addWidget(offsetSpin);
-
-		autoButton = new QPushButton(QStringLiteral("Auto"), this);
-		autoButton->setToolTip(QStringLiteral(
-			"Set the offset from the worst synced feed's peak "
-			"arrival latency, plus margin."));
-		QObject::connect(autoButton, &QAbstractButton::clicked, this,
-				 [this]() {
-					 if (recommendedMs > 0)
-						 irl_sync_set_offset_ms(
-							 static_cast<int>(
-								 recommendedMs));
-				 });
-		row->addWidget(autoButton);
 
 		recommendedLabel = new QLabel(this);
 		row->addWidget(recommendedLabel);
 
-		row->addSpacing(12);
-		row->addWidget(new QLabel(QStringLiteral("NTP"), this));
+		row->addStretch(1);
 
-		ntpEdit = new QLineEdit(this);
-		ntpEdit->setPlaceholderText(
-			QStringLiteral(IRL_SYNC_DEFAULT_NTP_SERVER));
-		/* Both ends have to be on a comparable reference, so this is
-		 * the one setting co-streamers have to read to each other. */
-		ntpEdit->setToolTip(QStringLiteral(
-			"Must be a reference the senders also use. Set the "
-			"same pool here and in each Moblin device."));
-		QObject::connect(ntpEdit, &QLineEdit::editingFinished, this,
-				 [this]() {
-					 irl_sync_set_ntp_server(
-						 ntpEdit->text()
-							 .trimmed()
-							 .toUtf8()
-							 .constData());
-				 });
-		row->addWidget(ntpEdit, 1);
+		auto *settingsButton = new QPushButton(this);
+		settingsButton->setToolTip(QStringLiteral("Sync settings"));
+		applyGearIcon(settingsButton);
+		QObject::connect(settingsButton, &QAbstractButton::clicked, this,
+				 [this]() { openSettings(); });
+		row->addWidget(settingsButton);
 
 		masterButton = new QPushButton(this);
 		masterButton->setCheckable(true);
@@ -433,9 +435,8 @@ private:
 	{
 		table = new QTableWidget(0, COL_COUNT, this);
 		table->setHorizontalHeaderLabels(
-			{QStringLiteral("Source"), QStringLiteral("Sync"),
-			 QStringLiteral("Timecode"), QStringLiteral("Latency"),
-			 QStringLiteral("Peak 60s"), QStringLiteral("Added"),
+			{QStringLiteral("Source"), QStringLiteral("Timecode"),
+			 QStringLiteral("Latency"), QStringLiteral("Added"),
 			 QStringLiteral("Error"), QStringLiteral("Status")});
 		table->verticalHeader()->setVisible(false);
 		table->verticalHeader()->setDefaultSectionSize(
@@ -455,7 +456,7 @@ private:
 
 		table->horizontalHeader()->setSectionResizeMode(
 			COL_SOURCE, QHeaderView::Stretch);
-		for (int i = COL_SYNC; i < COL_STATUS; i++) {
+		for (int i = COL_TIMECODE; i < COL_STATUS; i++) {
 			table->horizontalHeader()->setSectionResizeMode(
 				i, QHeaderView::ResizeToContents);
 		}
@@ -464,6 +465,55 @@ private:
 		table->horizontalHeader()->setSectionResizeMode(
 			COL_STATUS, QHeaderView::Interactive);
 		table->setColumnWidth(COL_STATUS, 240);
+	}
+
+	/* Modal and apply-on-OK, unlike the offset next to it. What lives here
+	 * is set once when the setup is built and then left alone, so it is
+	 * worth a deliberate confirmation and not worth the live round trip the
+	 * dock's own controls do. */
+	void openSettings()
+	{
+		QDialog dialog(this);
+		dialog.setWindowTitle(QStringLiteral("IRL Sync Settings"));
+
+		auto *box = new QVBoxLayout(&dialog);
+		auto *form = new QFormLayout();
+
+		struct irl_sync_config cfg;
+		irl_sync_config_get(&cfg);
+
+		auto *server = new QLineEdit(QString::fromUtf8(cfg.ntp_server),
+					     &dialog);
+		server->setPlaceholderText(
+			QStringLiteral(IRL_SYNC_DEFAULT_NTP_SERVER));
+		server->setMinimumWidth(220);
+		form->addRow(QStringLiteral("NTP server"), server);
+		box->addLayout(form);
+
+		/* The one setting that has to match on equipment this dock
+		 * cannot see, which is exactly why it needs saying here. */
+		auto *note = new QLabel(
+			QStringLiteral(
+				"Must be a reference the senders also use.\n"
+				"Set the same pool here and in each sending device."),
+			&dialog);
+		note->setStyleSheet(QString("color: %1;").arg(PANEL_DIM));
+		box->addWidget(note);
+
+		auto *buttons = new QDialogButtonBox(
+			QDialogButtonBox::Ok | QDialogButtonBox::Cancel,
+			&dialog);
+		QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog,
+				 &QDialog::accept);
+		QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog,
+				 &QDialog::reject);
+		box->addWidget(buttons);
+
+		if (dialog.exec() != QDialog::Accepted)
+			return;
+
+		irl_sync_set_ntp_server(
+			server->text().trimmed().toUtf8().constData());
 	}
 
 	void updateMasterButton(bool enabled)
@@ -588,43 +638,41 @@ private:
 		updateMasterButton(cfg.enabled);
 
 		/* Never fight the user mid-edit. */
-		if (!offsetSpin->hasFocus() &&
-		    offsetSpin->value() != cfg.offset_ms) {
+		const int offset_s = cfg.offset_ms / 1000;
+		if (!offsetSpin->hasFocus() && offsetSpin->value() != offset_s) {
 			offsetSpin->blockSignals(true);
-			offsetSpin->setValue(cfg.offset_ms);
+			offsetSpin->setValue(offset_s);
 			offsetSpin->blockSignals(false);
-		}
-		if (!ntpEdit->hasFocus() &&
-		    ntpEdit->text() != QString::fromUtf8(cfg.ntp_server)) {
-			ntpEdit->blockSignals(true);
-			ntpEdit->setText(QString::fromUtf8(cfg.ntp_server));
-			ntpEdit->blockSignals(false);
 		}
 	}
 
 	void refreshTable()
 	{
 		struct irl_sync_entry entries[IRL_SYNC_MAX_SOURCES];
-		const size_t count = irl_sync_collect(
+		const size_t collected = irl_sync_collect(
 			entries, sizeof(entries) / sizeof(entries[0]));
 
-		if (table->rowCount() != static_cast<int>(count))
-			table->setRowCount(static_cast<int>(count));
+		/* Sources that have not opted in are not part of the group and
+		 * have nothing to report, so they are left out entirely rather
+		 * than listed as a screenful of dashes. */
+		int count = 0;
+		for (size_t i = 0; i < collected; i++) {
+			if (entries[i].sync_enabled)
+				entries[count++] = entries[i];
+		}
+
+		if (table->rowCount() != count)
+			table->setRowCount(count);
 
 		int alarms = 0;
 		recommendedMs = 0;
 
-		for (size_t i = 0; i < count; i++) {
-			const struct irl_sync_entry &e = entries[i];
+		for (int row = 0; row < count; row++) {
+			const struct irl_sync_entry &e = entries[row];
 			const struct irl_sync_snapshot &s = e.snap;
-			const int row = static_cast<int>(i);
 
 			cell(row, COL_SOURCE)
 				->setText(QString::fromUtf8(e.source_name));
-			cell(row, COL_SYNC)
-				->setText(e.sync_enabled
-						  ? QStringLiteral("☑")
-						  : QStringLiteral("☐"));
 			cell(row, COL_TIMECODE)->setText(format_timecode(s));
 
 			const bool measured = s.have_timecode &&
@@ -634,10 +682,6 @@ private:
 			cell(row, COL_LATENCY)
 				->setText(measured ? format_ms(s.latency_ms)
 						   : QStringLiteral("—"));
-			cell(row, COL_PEAK)
-				->setText(measured
-						  ? format_ms(s.latency_peak_ms)
-						  : QStringLiteral("—"));
 			cell(row, COL_ADDED)
 				->setText(aligning ? format_ms(s.added_ms)
 						   : QStringLiteral("—"));
@@ -664,17 +708,24 @@ private:
 				status->setBackground(QBrush(Qt::NoBrush));
 			}
 
-			if (e.sync_enabled &&
-			    s.required_offset_ms > recommendedMs)
+			if (s.required_offset_ms > recommendedMs)
 				recommendedMs = s.required_offset_ms;
 		}
 
-		recommendedLabel->setText(
-			recommendedMs > 0
-				? QString("(needs ≥ %1)")
-					  .arg(format_ms(recommendedMs))
-				: QString());
-		autoButton->setEnabled(recommendedMs > 0);
+		/* A floor, not a recommendation: everything at or above it
+		 * holds. Flagged only when the offset is actually under it, so
+		 * it reads as a fault to fix rather than a number to chase. */
+		if (recommendedMs > 0) {
+			const bool under = irl_sync_offset_ms() < recommendedMs;
+			recommendedLabel->setText(
+				QString("min %1 s").arg(recommendedMs / 1000));
+			recommendedLabel->setStyleSheet(
+				under ? QStringLiteral(
+						"color: #f85149; font-weight: bold;")
+				      : QString("color: %1;").arg(PANEL_DIM));
+		} else {
+			recommendedLabel->clear();
+		}
 
 		/* Carries the state when the dock is collapsed or narrow. */
 		if (alarms > 0) {
@@ -686,6 +737,14 @@ private:
 						     : QStringLiteral("s")));
 			summaryLabel->setStyleSheet(QStringLiteral(
 				"color: #f85149; font-weight: bold;"));
+			summaryLabel->show();
+		} else if (count == 0) {
+			/* An empty table otherwise reads as "the dock is
+			 * broken" rather than "nothing has opted in". */
+			summaryLabel->setText(QStringLiteral(
+				"No sources have Sync enabled — tick Sync in a source's properties."));
+			summaryLabel->setStyleSheet(
+				QString("color: %1;").arg(PANEL_DIM));
 			summaryLabel->show();
 		} else {
 			summaryLabel->hide();

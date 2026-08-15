@@ -127,26 +127,31 @@ there. Today that means **Moblin**:
   disabled in its own source, and its RTMP path never carries the timecode.
 
 Then, in OBS: tick **Sync** on each source, open **View → Docks → IRL Sync**,
-set the same NTP pool, pick an offset, and switch it on.
+set the same NTP pool under the ⚙ button, pick an offset, and switch it on.
 
 ### Choosing an offset
 
-The offset must be larger than the feed's real arrival latency, or its frames
-are already past their slot when they get here. The dock shows, per source:
+The offset is set in **whole seconds**, because it is a number co-streamers
+read to each other and "six" is something two people can agree on over a call.
+
+It must be larger than the feed's real arrival latency, or its frames are
+already past their slot when they get here. The dock lists every source with
+Sync ticked, and shows:
 
 - **Latency** — how stale the freshest data is. A property of the sender and
   the network; nothing you set changes it.
-- **Peak 60s** — the rolling maximum. This is what to pick an offset against.
-  Bonded cellular does not degrade gently, and an offset chosen against the
-  instantaneous value will hold right up until the first bitrate dip.
 - **Added** — how much extra hold the plugin is applying to reach the target.
 - **Error** — how far the actual presentation lands from the target. Near zero
   once locked.
 
-**Auto** sets the offset from the worst synced feed's peak plus margin. A feed
-that cannot reach the offset turns red and says the value that would fix it, so
-you can either raise the offset yourself or pass the number to whoever is
-holding the phone.
+Next to the offset, **min N s** is the smallest setting that clears every
+synced feed's rolling 60-second peak latency — the peak rather than the
+instantaneous value, because bonded cellular does not degrade gently and an
+offset chosen against the current reading holds right up until the first
+bitrate dip. It turns red when the offset is below it. A feed that cannot reach
+the offset turns red too and says the value that would fix it, so you can
+either raise the offset yourself or pass the number to whoever is holding the
+phone.
 
 Raising the offset raises latency for everyone, so it is a real cost — sync
 means every feed waits for the slowest one.
@@ -490,7 +495,7 @@ Stats are exposed through OBS's `proc_handler` API under the `get_stats` call, a
 | `sync_latency_peak_ms` | int | Rolling 60s maximum of the above. Pick an offset against this, not the instantaneous value |
 | `sync_added_ms` | int | Extra hold currently applied to reach the target presentation time |
 | `sync_error_ms` | int | How far the actual presentation lands from the target. Near zero when locked |
-| `sync_required_offset_ms` | int | Smallest offset at which this source could hold sync |
+| `sync_required_offset_ms` | int | Smallest offset at which this source could hold sync: its peak latency rounded up to a whole second |
 
 ### OBS log stats
 

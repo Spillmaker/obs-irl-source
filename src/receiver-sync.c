@@ -309,6 +309,17 @@ static void set_tc_reason(struct irl_source *ctx, enum irl_sync_tc_reason reason
 	}
 }
 
+/* The smallest offset the control can be set to that still clears `peak_ms`.
+ * See irl_sync_snapshot.required_offset_ms. */
+static int64_t required_offset_ms(int64_t peak_ms)
+{
+	if (peak_ms <= 0)
+		return 0;
+	return ((peak_ms + IRL_SYNC_OFFSET_STEP_MS - 1) /
+		IRL_SYNC_OFFSET_STEP_MS) *
+	       IRL_SYNC_OFFSET_STEP_MS;
+}
+
 static void publish(struct irl_source *ctx)
 {
 	struct irl_sync_snapshot snap = {0};
@@ -323,8 +334,7 @@ static void publish(struct irl_source *ctx)
 
 	int64_t peak_ns = peak_value(ctx);
 	snap.latency_peak_ms = peak_ns / 1000000LL;
-	snap.required_offset_ms =
-		snap.latency_peak_ms + IRL_SYNC_OFFSET_MARGIN_MS;
+	snap.required_offset_ms = required_offset_ms(snap.latency_peak_ms);
 
 	irl_sync_publish(ctx, &snap);
 }
@@ -416,8 +426,7 @@ static void update_status(struct irl_source *ctx, uint64_t now_ns,
 		     "[irl-source] Sync: feed arrives %lldms late, past the %dms offset; raise the offset to at least %lldms",
 		     (long long)(ctx->sync_latency_ns / 1000000LL),
 		     irl_sync_offset_ms(),
-		     (long long)(peak_value(ctx) / 1000000LL +
-				 IRL_SYNC_OFFSET_MARGIN_MS));
+		     (long long)required_offset_ms(peak_value(ctx) / 1000000LL));
 	} else if (alarmed && reachable &&
 		   now_ns - ctx->sync_in_reach_since_ns >= SYNC_ALARM_LEAVE_NS) {
 		alarmed = false;

@@ -45,10 +45,12 @@ struct irl_source;
 #define IRL_SYNC_MAX_OFFSET_MS 30000
 #define IRL_SYNC_DEFAULT_NTP_SERVER "pool.ntp.org"
 
-/* Headroom added to the observed peak latency when recommending an offset.
- * Bonded cellular does not degrade gently, so the recommendation has to sit
- * clear of the peak rather than on it. */
-#define IRL_SYNC_OFFSET_MARGIN_MS 1500
+/* The offset is set, and reported, in whole seconds. It is a number
+ * co-streamers read to each other to land on the same target, and "six" is a
+ * thing two people can agree on over a call in a way that 6123ms is not. The
+ * stored value stays in milliseconds because everything downstream computes in
+ * time, not in UI steps. */
+#define IRL_SYNC_OFFSET_STEP_MS 1000
 
 /* Rolling window over which arrival latency is peak-held, as a bucket count;
  * receiver-sync.c sets the bucket duration. */
@@ -117,8 +119,15 @@ struct irl_sync_snapshot {
 	int64_t latency_peak_ms;
 	int64_t added_ms;
 	int64_t error_ms;
-	/* latency_peak_ms + margin: the smallest offset at which this source
-	 * could hold sync. Shown so a red row says what to do about it. */
+	/* The smallest settable offset at which this source could hold sync:
+	 * latency_peak_ms rounded up to a whole second. Shown so a red row says
+	 * what to do about it.
+	 *
+	 * Deliberately not padded with headroom. A source locks whenever the
+	 * offset is at or above its arrival latency, so quoting a padded figure
+	 * as the requirement reads as a bug the first time someone locks fine
+	 * below it. Rounding up to the step the control offers gives half a
+	 * second of slack on average and stays honest. */
 	int64_t required_offset_ms;
 };
 
