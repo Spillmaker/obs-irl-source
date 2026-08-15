@@ -68,9 +68,9 @@ struct irl_source;
 #define IRL_SYNC_ERROR_WINDOW_NS 1000000000ULL
 #define IRL_SYNC_ERROR_SAMPLES 256
 
-/* Completed timecode seconds the frame rate is held over. A rolling maximum,
- * so a second that lost packets cannot drag the estimate down, and a genuine
- * rate change still lands within this many seconds. */
+/* Completed timecode seconds the frame rate is decided from. Enough for two
+ * of them to agree while a damaged one is outvoted, and small enough that a
+ * genuine rate change still lands within this many seconds. */
 #define IRL_SYNC_FPS_SECONDS 4
 
 /* ── Per-source status ────────────────────────────────────── */

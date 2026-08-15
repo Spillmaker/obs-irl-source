@@ -340,9 +340,9 @@ static void set_tc_reason(struct irl_source *ctx, enum irl_sync_tc_reason reason
  * measurement is both cross-thread and only written once frames are coming out
  * the far side of the keyframe gate.
  *
- * A maximum, not a count of stamps seen, so lost packets can only make the
- * estimate arrive later — never make it wrong in a way that would be silently
- * folded into every latency measurement afterwards.
+ * Taken from agreement between seconds rather than from any single one, so
+ * neither a lossy second nor a corrupt SEI can push a wrong figure into every
+ * latency measurement afterwards. See tc_rate_record().
  */
 static void tc_rate_record(struct irl_source *ctx, uint16_t max_frames)
 {
@@ -351,22 +351,43 @@ static void tc_rate_record(struct irl_source *ctx, uint16_t max_frames)
 	if (ctx->sync_fps_count < IRL_SYNC_FPS_SECONDS)
 		ctx->sync_fps_count++;
 
-	/* Two seconds before committing to a figure. One second that happened
-	 * to lose its last few packets reads as a lower rate, and because the
-	 * first measurement is what seeds the hold at engage, adopting it
-	 * would bake that in. A second second costs a second of acquire time
-	 * and makes a short read merely late instead of wrong. */
-	if (ctx->sync_fps_count < 2)
-		return;
-
-	uint16_t highest = 0;
+	/* The count the recent seconds agree on — not the highest of them.
+	 *
+	 * Taking the maximum is the obvious choice and is wrong. It is robust
+	 * to loss, which can only ever shorten a second, and that was the
+	 * reasoning. But a corrupt SEI yields a garbage n_frames that is just
+	 * as likely to be high as low, and a maximum adopts it outright. Not
+	 * hypothetical: a 30fps sender read as "41 frames per second" across a
+	 * reconnect, which put a quarter-second sawtooth into every latency
+	 * measurement until it aged out.
+	 *
+	 * Requiring two of the recent seconds to agree rejects both failure
+	 * modes at once, because loss and corruption both produce one-off
+	 * values that nothing else matches. Ties go to the larger count, since
+	 * between two plausible readings the short one is the damaged one. */
+	uint16_t agreed = 0;
+	int best_votes = 0;
 	for (int i = 0; i < ctx->sync_fps_count; i++) {
-		if (ctx->sync_fps_recent[i] > highest)
-			highest = ctx->sync_fps_recent[i];
+		const uint16_t candidate = ctx->sync_fps_recent[i];
+		int votes = 0;
+
+		for (int j = 0; j < ctx->sync_fps_count; j++) {
+			if (ctx->sync_fps_recent[j] == candidate)
+				votes++;
+		}
+
+		if (votes > best_votes ||
+		    (votes == best_votes && candidate > agreed)) {
+			best_votes = votes;
+			agreed = candidate;
+		}
 	}
 
+	if (best_votes < 2)
+		return;
+
 	/* Indices are zero-based, so the count is one more than the highest. */
-	int64_t interval_ns = 1000000000LL / ((int64_t)highest + 1);
+	int64_t interval_ns = 1000000000LL / ((int64_t)agreed + 1);
 
 	/* Outside what any real stream runs at: a corrupt SEI, or a sender
 	 * counting something other than frames. Keep whatever was already
@@ -380,7 +401,7 @@ static void tc_rate_record(struct irl_source *ctx, uint16_t max_frames)
 		ctx->sync_fps_interval_ns = interval_ns;
 		blog(LOG_INFO,
 		     "[irl-source] Sync: sender is stamping %d frames per second",
-		     (int)highest + 1);
+		     (int)agreed + 1);
 	}
 }
 
