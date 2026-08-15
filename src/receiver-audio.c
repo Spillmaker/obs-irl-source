@@ -773,6 +773,14 @@ bool irl_pump_audio_once(struct irl_source *ctx)
 		return true;
 
 	if (!ctx->audio_out_primed) {
+		/* Sync seeds a multi-second hold the moment it engages. Priming
+		 * before that means the hold lands on a running pipeline and
+		 * starves it; priming after costs nothing, because nothing is
+		 * playing yet. Bounded by a deadline on the other side, so a
+		 * feed that can never sync still gets audio. */
+		if (irl_sync_prime_held(ctx))
+			return false;
+
 		int prime_ms = 0;
 		if (!low_latency) {
 			prime_ms = ctx->audio_buf.target_ms +

@@ -77,6 +77,23 @@
 /* No timecode for this long and the source has stopped being alignable. */
 #define SYNC_TC_STALE_NS 3000000000ULL
 
+/* Longest the audio output is kept from priming while sync works out its hold.
+ *
+ * The seed at engage is a step of whatever the offset needs — seconds, often —
+ * and a step that size applied to a pipeline that has already primed starves
+ * it: packets stop flowing for the length of the step while the jitter buffer
+ * drains at real time. Priming *after* the hold exists costs nothing, because
+ * nothing is playing yet to starve. That was always the design; what broke it
+ * was engage moving later than priming once the frame rate had to be learned
+ * first.
+ *
+ * The deadline is the backstop for everything that means engage will never
+ * come — a sender that stamps nothing, a rate that never resolves — because a
+ * source that stays silent is far worse than one that primes unsynced and
+ * takes the hold as a hitch. Normal engage is well inside a second of the
+ * first video frame, so this is not on the happy path. */
+#define SYNC_PRIME_WAIT_NS 3000000000ULL
+
 /* Hysteresis on the "cannot reach the offset" alarm.
  *
  * Bonded cellular spikes constantly, and a feed will cross the threshold for a
@@ -396,10 +413,12 @@ static void tc_rate_observe(struct irl_source *ctx,
  * n_frames x (assumed - actual) of error into every latency reading, which at
  * the top of the range is seconds, and would then be seeded into the hold and
  * held in the latency peak long after the real rate was known. */
-static bool tc_frame_interval_ns(struct irl_source *ctx, int64_t *interval_ns)
+static bool tc_frame_interval_ns(struct irl_source *ctx, int64_t *interval_ns,
+				 const char **origin)
 {
 	if (ctx->sync_fps_interval_ns > 0) {
 		*interval_ns = ctx->sync_fps_interval_ns;
+		*origin = "timecodes";
 		return true;
 	}
 
@@ -412,6 +431,7 @@ static bool tc_frame_interval_ns(struct irl_source *ctx, int64_t *interval_ns)
 	if (decoded_ns >= IRL_VIDEO_INTERVAL_MIN_NS &&
 	    decoded_ns <= IRL_VIDEO_INTERVAL_MAX_NS) {
 		*interval_ns = decoded_ns;
+		*origin = "decoder";
 		return true;
 	}
 
@@ -541,6 +561,9 @@ void irl_sync_reset(struct irl_source *ctx)
 	ctx->sync_latency_ns = 0;
 	ctx->sync_error_ns = 0;
 	error_filter_reset(ctx);
+	os_atomic_set_bool(&ctx->sync_prime_hold, false);
+	ctx->sync_released_once = false;
+	ctx->sync_prime_deadline_ns = 0;
 	ctx->sync_fps_interval_ns = 0;
 	ctx->sync_fps_next = 0;
 	ctx->sync_fps_count = 0;
@@ -653,7 +676,8 @@ static void observe_timecode(struct irl_source *ctx, const AVPacket *pkt,
 	tc_rate_observe(ctx, tc);
 
 	int64_t frame_interval_ns;
-	if (!tc_frame_interval_ns(ctx, &frame_interval_ns)) {
+	const char *interval_origin = "";
+	if (!tc_frame_interval_ns(ctx, &frame_interval_ns, &interval_origin)) {
 		/* Timecodes are arriving, but nothing has established the frame
 		 * rate yet, so n_frames cannot be turned into time. Normally
 		 * one timecode second. Hold the stamp for the dock and keep the
@@ -714,8 +738,17 @@ static void observe_timecode(struct irl_source *ctx, const AVPacket *pkt,
 		ctx->sync_offset_generation = irl_sync_offset_generation();
 		error_filter_reset(ctx);
 
+		/* Now that the hold is known, the priming gate can be given the
+		 * time it actually needs: the line goes quiet for the length of
+		 * the hold before its first release. The initial deadline only
+		 * ever covered "will this source engage at all". */
+		ctx->sync_prime_deadline_ns = now_ns +
+					      (uint64_t)ctx->sync_hold_ns +
+					      SYNC_PRIME_WAIT_NS;
+
 		blog(LOG_INFO,
-		     "[irl-source] Sync engaged: feed latency %lldms, offset %dms, holding %lldms",
+		     "[irl-source] Sync engaged: %.2ffps (from %s), feed latency %lldms, offset %dms, holding %lldms",
+		     1000000000.0 / (double)frame_interval_ns, interval_origin,
 		     (long long)(latency_ns / 1000000LL), irl_sync_offset_ms(),
 		     (long long)(ctx->sync_hold_ns / 1000000LL));
 	}
@@ -837,9 +870,46 @@ static void observe_timecode(struct irl_source *ctx, const AVPacket *pkt,
 
 /* ── Receiver-thread entry points ─────────────────────────── */
 
+/* Whether the audio thread should still be holding off priming. Recomputed on
+ * every packet, from the receiver thread that owns all of this state.
+ *
+ * Released as soon as any of the reasons to wait stops applying: the hold is
+ * seeded, the source turns out to have nothing to align against, sync is off,
+ * or the deadline passes. */
+static void update_prime_gate(struct irl_source *ctx, uint64_t now_ns)
+{
+	/* Engaging is not the finish line: seeding the hold stops the line for
+	 * the length of the hold, so priming the instant it engages starves the
+	 * pipeline exactly as priming before it did. What the gate is waiting
+	 * for is the line flowing again — the first release. */
+	/* A source already arriving late enough for the offset needs no hold,
+	 * so the line never queues anything and there is no first release to
+	 * wait for. It is flowing the moment it engages. */
+	bool flowing = ctx->sync_released_once ||
+		       (ctx->sync_engaged && ctx->sync_hold_ns <= 0);
+
+	bool hold = sync_wanted(ctx) && !flowing &&
+		    ctx->sync_status != IRL_SYNC_NO_TIMECODE &&
+		    now_ns < ctx->sync_prime_deadline_ns;
+
+	if (hold != os_atomic_load_bool(&ctx->sync_prime_hold))
+		os_atomic_set_bool(&ctx->sync_prime_hold, hold);
+}
+
+bool irl_sync_prime_held(struct irl_source *ctx)
+{
+	return os_atomic_load_bool(&ctx->sync_prime_hold);
+}
+
 void irl_sync_observe(struct irl_source *ctx, const AVPacket *pkt)
 {
 	uint64_t now_ns = os_gettime_ns();
+
+	/* First packet of the stream: start the clock the gate runs against.
+	 * Here rather than in irl_sync_reset because reset has no `now`, and
+	 * nothing can prime before a packet has been read anyway. */
+	if (ctx->sync_prime_deadline_ns == 0)
+		ctx->sync_prime_deadline_ns = now_ns + SYNC_PRIME_WAIT_NS;
 
 	if (!sync_wanted(ctx)) {
 		if (ctx->sync_status != IRL_SYNC_OFF) {
@@ -855,6 +925,7 @@ void irl_sync_observe(struct irl_source *ctx, const AVPacket *pkt)
 		 * re-seeds from scratch. */
 		ctx->sync_engaged = false;
 		release_hold(ctx, now_ns);
+		update_prime_gate(ctx, now_ns);
 		return;
 	}
 
@@ -881,6 +952,8 @@ void irl_sync_observe(struct irl_source *ctx, const AVPacket *pkt)
 		ctx->sync_engaged = false;
 		release_hold(ctx, now_ns);
 	}
+
+	update_prime_gate(ctx, now_ns);
 
 	/* ~5Hz is plenty for a dock and keeps this off the per-packet path. */
 	if (now_ns - ctx->sync_publish_ns >= 200000000ULL) {
@@ -939,5 +1012,9 @@ void irl_sync_drain(struct irl_source *ctx, AVFrame *frame)
 
 		irl_dispatch_packet(ctx, pkt, frame);
 		av_packet_free(&pkt);
+
+		/* The line has started flowing again, which is the condition
+		 * the priming gate is really waiting on. */
+		ctx->sync_released_once = true;
 	}
 }

@@ -568,6 +568,14 @@ struct irl_source {
 	 * change to land or it winds itself up. See observe_timecode(). */
 	uint64_t sync_settle_until_ns;
 	uint64_t sync_publish_ns;
+	/* Audio priming gate. Written by the receiver thread, read by the audio
+	 * thread, so both go through os_atomic_*_bool. See update_prime_gate().
+	 * The deadline beside it is receiver-thread only. */
+	bool sync_prime_hold;
+	/* Set on the delay line's first release: the point the pipeline is
+	 * flowing again and the audio output can safely prime. */
+	bool sync_released_once;
+	uint64_t sync_prime_deadline_ns;
 	uint64_t sync_too_slow_since_ns;
 	uint64_t sync_in_reach_since_ns;
 	/* Frame rate as learned from the timecodes themselves, so converting

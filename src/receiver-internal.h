@@ -41,5 +41,9 @@ bool irl_sync_hold(struct irl_source *ctx, AVPacket *pkt);
 /* Release everything whose moment has come. */
 void irl_sync_drain(struct irl_source *ctx, AVFrame *frame);
 bool irl_sync_delay_full(const struct irl_source *ctx);
+/* True while the audio output must not prime yet: sync is about to seed a hold,
+ * and a hold applied to an already-running pipeline starves it. Read from the
+ * audio thread. */
+bool irl_sync_prime_held(struct irl_source *ctx);
 void irl_sync_reset(struct irl_source *ctx);
 void irl_sync_free(struct irl_source *ctx);
