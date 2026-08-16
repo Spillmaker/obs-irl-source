@@ -27,6 +27,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <obs-module.h>
+#include <libavcodec/avcodec.h>
+
 #include "irl-sei.h"
 
 #ifdef __cplusplus
@@ -53,7 +56,7 @@ struct irl_source;
 #define IRL_SYNC_OFFSET_STEP_MS 1000
 
 /* Rolling window over which arrival latency is peak-held, as a bucket count;
- * receiver-sync.c sets the bucket duration. */
+ * sync-control.c sets the bucket duration. */
 #define IRL_SYNC_PEAK_BUCKETS 12
 
 /* How long the presentation error is averaged over. See
@@ -162,7 +165,7 @@ struct irl_sync_config {
 };
 
 /* Read the current settings. They persist in the module config directory,
- * loaded by irl_sync_init() and written by each setter below — global rather
+ * loaded at module load and written by each setter below — global rather
  * than per-source, so they live outside the scene collection: the offset is a
  * number a group of streamers agrees on, not a property of one machine's
  * layout. A scene collection copied to another machine therefore arrives
@@ -204,14 +207,106 @@ size_t irl_sync_collect(struct irl_sync_entry *entries, size_t max);
 bool irl_sync_get_snapshot(struct irl_source *ctx,
 			   struct irl_sync_snapshot *out);
 
-void irl_sync_init(void);
-void irl_sync_shutdown(void);
+/* ── Receiver hooks ───────────────────────────────────────── */
+
+/* Everything the media path calls, and the whole of it. Three of these are in
+ * the read loop, two in the audio pump and two in the source lifecycle; each
+ * is one line at its call site, and each call site carries a "timecode sync"
+ * marker comment so the whole set greps out in one go.
+ *
+ * They take struct irl_source because a controller over the pipeline has to
+ * see the pipeline. That is the one direction of coupling this split does not
+ * remove, and hiding it behind an abstraction would cost more than it buys. */
+/* Fold a freshly read packet into the controller — extract its timecode if it
+ * has one, measure, move the hold — and then decide whether the delay line
+ * keeps it. True means the line took it and the caller must not dispatch it.
+ *
+ * The two halves are one call because the read loop has no use for them apart:
+ * measuring without holding would be a stats feature, and holding without
+ * measuring cannot know for how long. */
+bool irl_sync_intercept(struct irl_source *ctx, AVPacket *pkt);
+/* Release everything whose moment has come. */
+void irl_sync_drain(struct irl_source *ctx, AVFrame *frame);
+/* Block while the delay line is at its ceiling, draining as room appears, so
+ * the excess is held by the transport rather than by this process. False when
+ * the thread was asked to stop while waiting — the caller must break. */
+bool irl_sync_wait_for_room(struct irl_source *ctx, AVFrame *frame);
+/* True while the audio output must not prime yet: sync is about to seed a hold,
+ * and a hold applied to an already-running pipeline starves it. Read from the
+ * audio thread. */
+bool irl_sync_prime_held(struct irl_source *ctx);
+/* Where the audio holding this PTS has to start playing, in the OBS clock, for
+ * the stream to land on its configured offset. False when sync has nothing to
+ * say — no timecodes, no NTP reference, sync off — or when the placement is
+ * already in the past, which anchoring cannot fix. Called from the audio thread
+ * at prime. */
+bool irl_sync_playout_anchor(struct irl_source *ctx, int64_t pts_ns,
+			     uint64_t now_ns, uint64_t *anchor_ns);
+void irl_sync_reset(struct irl_source *ctx);
+void irl_sync_free(struct irl_source *ctx);
+
+/* ── Statistics ───────────────────────────────────────────── */
+
+/* The fields sync contributes to a source's get_stats proc, as the declaration
+ * fragment and the code that fills it. Both live here so they cannot drift
+ * apart, and so irl-source.c carries one line of each instead of twenty. The
+ * third place a new field has to appear is irl_stat_fields[] in
+ * websocket-vendor.c; see the table in README.md. */
+#define IRL_SYNC_STATS_PROC_DECL \
+	"out bool sync_enabled, " \
+	"out string sync_status, out string sync_timecode, " \
+	"out int sync_latency_ms, out int sync_latency_peak_ms, " \
+	"out int sync_added_ms, out int sync_error_ms, " \
+	"out int sync_required_offset_ms"
+
+void irl_sync_stats(struct irl_source *ctx, calldata_t *cd);
+
+/* The same fields as rows for irl_stat_fields[] in websocket-vendor.c, so the
+ * two lists cannot fall out of step. */
+#define IRL_SYNC_STAT_FIELDS \
+	{"sync_enabled", IRL_STAT_BOOL}, \
+	{"sync_status", IRL_STAT_STRING}, \
+	{"sync_timecode", IRL_STAT_STRING}, \
+	{"sync_latency_ms", IRL_STAT_INT}, \
+	{"sync_latency_peak_ms", IRL_STAT_INT}, \
+	{"sync_added_ms", IRL_STAT_INT}, \
+	{"sync_error_ms", IRL_STAT_INT}, \
+	{"sync_required_offset_ms", IRL_STAT_INT},
+
+/* The vendor's GetSyncStatus request, in the shape obs-websocket wants. The
+ * whole handler lives in src/sync/ so websocket-vendor.c carries one table row
+ * and one dispatch entry. */
+void irl_sync_vendor_status(obs_data_t *request_data,
+			    obs_data_t *response_data, void *priv_data);
+
+/* ── Per-source settings ──────────────────────────────────── */
+
+/* The "Sync" checkbox and its help text, added to the source's own properties.
+ * Called from settings.c; the wording, the key and the default all live in
+ * src/sync/ so a change to any of them touches nothing else. */
+void irl_sync_source_defaults(obs_data_t *settings);
+void irl_sync_source_properties(obs_properties_t *props);
+
+/* ── Module lifecycle ─────────────────────────────────────── */
+
+/* The whole feature's hooks into the plugin's own lifecycle, one call each, so
+ * plugin.c never has to know what sync is made of. Everything they start —
+ * the NTP client, the settings store, the source registry, the dock — is
+ * private to src/sync/.
+ *
+ * _post_load exists because two of those pieces cannot run any earlier: the
+ * dock needs the frontend, which is only guaranteed once module loading has
+ * finished. */
+void irl_sync_module_load(void);
+void irl_sync_module_post_load(void);
+void irl_sync_module_unload(void);
 
 /* ── Dock (sync-dock.cpp) ─────────────────────────────────── */
 
 /* Defined only when the plugin is built with IRL_ENABLE_DOCK, which needs Qt
  * and obs-frontend-api. Without it everything above still works and the
- * status is reachable over the websocket vendor. */
+ * status is reachable over the websocket vendor. Called from
+ * irl_sync_module_post_load(); nothing outside src/sync/ uses these. */
 void irl_sync_dock_register(void);
 void irl_sync_dock_unregister(void);
 

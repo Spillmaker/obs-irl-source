@@ -5,7 +5,7 @@
  * Copyright (C) 2026 Thomas Lekanger
  * SPDX-License-Identifier: AGPL-3.0-or-later
  *
- * receiver-sync.c — absolute-time presentation control.
+ * sync-control.c — absolute-time presentation control.
  *
  * Every synced source targets the same rule: the frame stamped T is presented
  * at NTP time T + offset. Sources do not negotiate; the alignment falls out of
@@ -36,10 +36,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "receiver-internal.h"
+#include "../receiver-internal.h"
 
-#include "../include/irl-ntp.h"
-#include "../include/irl-sync.h"
+#include "../../include/sync/irl-ntp.h"
+#include "../../include/sync/irl-sync.h"
 
 /* Presentation error we call aligned, and the wider band we have to leave
  * before admitting we are not. One frame at 60fps is 16.7ms; the tolerance
@@ -291,18 +291,18 @@ static bool predict_presentation_ns(struct irl_source *ctx, int64_t pts_ns,
 static void peak_record(struct irl_source *ctx, int64_t latency_ns,
 			uint64_t now_ns)
 {
-	if (ctx->sync_peak_bucket_start_ns == 0)
-		ctx->sync_peak_bucket_start_ns = now_ns;
+	if (ctx->sync.peak_bucket_start_ns == 0)
+		ctx->sync.peak_bucket_start_ns = now_ns;
 
-	while (now_ns - ctx->sync_peak_bucket_start_ns >= SYNC_PEAK_BUCKET_NS) {
-		ctx->sync_peak_bucket =
-			(ctx->sync_peak_bucket + 1) % IRL_SYNC_PEAK_BUCKETS;
-		ctx->sync_peak_buckets[ctx->sync_peak_bucket] = INT64_MIN;
-		ctx->sync_peak_bucket_start_ns += SYNC_PEAK_BUCKET_NS;
+	while (now_ns - ctx->sync.peak_bucket_start_ns >= SYNC_PEAK_BUCKET_NS) {
+		ctx->sync.peak_bucket =
+			(ctx->sync.peak_bucket + 1) % IRL_SYNC_PEAK_BUCKETS;
+		ctx->sync.peak_buckets[ctx->sync.peak_bucket] = INT64_MIN;
+		ctx->sync.peak_bucket_start_ns += SYNC_PEAK_BUCKET_NS;
 	}
 
-	if (latency_ns > ctx->sync_peak_buckets[ctx->sync_peak_bucket])
-		ctx->sync_peak_buckets[ctx->sync_peak_bucket] = latency_ns;
+	if (latency_ns > ctx->sync.peak_buckets[ctx->sync.peak_bucket])
+		ctx->sync.peak_buckets[ctx->sync.peak_bucket] = latency_ns;
 }
 
 static int64_t peak_value(const struct irl_source *ctx)
@@ -310,8 +310,8 @@ static int64_t peak_value(const struct irl_source *ctx)
 	int64_t peak = INT64_MIN;
 
 	for (int i = 0; i < IRL_SYNC_PEAK_BUCKETS; i++) {
-		if (ctx->sync_peak_buckets[i] > peak)
-			peak = ctx->sync_peak_buckets[i];
+		if (ctx->sync.peak_buckets[i] > peak)
+			peak = ctx->sync.peak_buckets[i];
 	}
 
 	return peak == INT64_MIN ? 0 : peak;
@@ -343,9 +343,9 @@ static enum irl_sync_tc_reason diagnose_missing_timecode(struct irl_source *ctx)
  * explains itself in the log without repeating every packet. */
 static void set_tc_reason(struct irl_source *ctx, enum irl_sync_tc_reason reason)
 {
-	if (ctx->sync_tc_reason == reason)
+	if (ctx->sync.tc_reason == reason)
 		return;
-	ctx->sync_tc_reason = reason;
+	ctx->sync.tc_reason = reason;
 
 	switch (reason) {
 	case IRL_SYNC_TC_NO_CLOCK:
@@ -392,10 +392,10 @@ static void set_tc_reason(struct irl_source *ctx, enum irl_sync_tc_reason reason
  */
 static void tc_rate_record(struct irl_source *ctx, uint16_t max_frames)
 {
-	ctx->sync_fps_recent[ctx->sync_fps_next] = max_frames;
-	ctx->sync_fps_next = (ctx->sync_fps_next + 1) % IRL_SYNC_FPS_SECONDS;
-	if (ctx->sync_fps_count < IRL_SYNC_FPS_SECONDS)
-		ctx->sync_fps_count++;
+	ctx->sync.fps_recent[ctx->sync.fps_next] = max_frames;
+	ctx->sync.fps_next = (ctx->sync.fps_next + 1) % IRL_SYNC_FPS_SECONDS;
+	if (ctx->sync.fps_count < IRL_SYNC_FPS_SECONDS)
+		ctx->sync.fps_count++;
 
 	/* The count the recent seconds agree on — not the highest of them.
 	 *
@@ -413,12 +413,12 @@ static void tc_rate_record(struct irl_source *ctx, uint16_t max_frames)
 	 * between two plausible readings the short one is the damaged one. */
 	uint16_t agreed = 0;
 	int best_votes = 0;
-	for (int i = 0; i < ctx->sync_fps_count; i++) {
-		const uint16_t candidate = ctx->sync_fps_recent[i];
+	for (int i = 0; i < ctx->sync.fps_count; i++) {
+		const uint16_t candidate = ctx->sync.fps_recent[i];
 		int votes = 0;
 
-		for (int j = 0; j < ctx->sync_fps_count; j++) {
-			if (ctx->sync_fps_recent[j] == candidate)
+		for (int j = 0; j < ctx->sync.fps_count; j++) {
+			if (ctx->sync.fps_recent[j] == candidate)
 				votes++;
 		}
 
@@ -443,8 +443,8 @@ static void tc_rate_record(struct irl_source *ctx, uint16_t max_frames)
 	    interval_ns > IRL_VIDEO_INTERVAL_MAX_NS)
 		return;
 
-	if (ctx->sync_fps_interval_ns != interval_ns) {
-		ctx->sync_fps_interval_ns = interval_ns;
+	if (ctx->sync.fps_interval_ns != interval_ns) {
+		ctx->sync.fps_interval_ns = interval_ns;
 		blog(LOG_INFO,
 		     "[irl-source] Sync: sender is stamping %d frames per second",
 		     (int)agreed + 1);
@@ -454,9 +454,9 @@ static void tc_rate_record(struct irl_source *ctx, uint16_t max_frames)
 static void tc_rate_observe(struct irl_source *ctx,
 			    const struct irl_timecode *tc)
 {
-	if (ctx->sync_tc_have_second && tc->seconds == ctx->sync_tc_second) {
-		if (tc->n_frames > ctx->sync_tc_max_frames)
-			ctx->sync_tc_max_frames = tc->n_frames;
+	if (ctx->sync.tc_have_second && tc->seconds == ctx->sync.tc_second) {
+		if (tc->n_frames > ctx->sync.tc_max_frames)
+			ctx->sync.tc_max_frames = tc->n_frames;
 		return;
 	}
 
@@ -467,12 +467,12 @@ static void tc_rate_observe(struct irl_source *ctx,
 	 * observes that second's tail, which is where its maximum is. Only
 	 * lost packets can shorten a second, and the rolling maximum over
 	 * IRL_SYNC_FPS_SECONDS is what covers that. */
-	if (ctx->sync_tc_have_second)
-		tc_rate_record(ctx, ctx->sync_tc_max_frames);
+	if (ctx->sync.tc_have_second)
+		tc_rate_record(ctx, ctx->sync.tc_max_frames);
 
-	ctx->sync_tc_second = tc->seconds;
-	ctx->sync_tc_max_frames = tc->n_frames;
-	ctx->sync_tc_have_second = true;
+	ctx->sync.tc_second = tc->seconds;
+	ctx->sync.tc_max_frames = tc->n_frames;
+	ctx->sync.tc_have_second = true;
 }
 
 /* The interval to convert n_frames with, or false if nothing has measured one
@@ -483,8 +483,8 @@ static void tc_rate_observe(struct irl_source *ctx,
 static bool tc_frame_interval_ns(struct irl_source *ctx, int64_t *interval_ns,
 				 const char **origin)
 {
-	if (ctx->sync_fps_interval_ns > 0) {
-		*interval_ns = ctx->sync_fps_interval_ns;
+	if (ctx->sync.fps_interval_ns > 0) {
+		*interval_ns = ctx->sync.fps_interval_ns;
 		*origin = "timecodes";
 		return true;
 	}
@@ -516,8 +516,8 @@ static int cmp_int64(const void *a, const void *b)
 
 static void error_filter_reset(struct irl_source *ctx)
 {
-	ctx->sync_error_head = 0;
-	ctx->sync_error_count = 0;
+	ctx->sync.error_head = 0;
+	ctx->sync.error_count = 0;
 }
 
 /* Fold one presentation-error reading in and return the filtered window value.
@@ -548,38 +548,38 @@ static void error_filter_reset(struct irl_source *ctx)
 static int64_t error_filter_push(struct irl_source *ctx, int64_t error_ns,
 				 uint64_t now_ns)
 {
-	if (ctx->sync_error_count == IRL_SYNC_ERROR_SAMPLES) {
+	if (ctx->sync.error_count == IRL_SYNC_ERROR_SAMPLES) {
 		/* Full before the window expired: a rate above what the
 		 * interval bounds accept, or timecodes on every field of an
 		 * interlaced feed. Dropping the oldest keeps the window to the
 		 * most recent second's worth either way. */
-		ctx->sync_error_head =
-			(ctx->sync_error_head + 1) % IRL_SYNC_ERROR_SAMPLES;
-		ctx->sync_error_count--;
+		ctx->sync.error_head =
+			(ctx->sync.error_head + 1) % IRL_SYNC_ERROR_SAMPLES;
+		ctx->sync.error_count--;
 	}
 
-	int tail = (ctx->sync_error_head + ctx->sync_error_count) %
+	int tail = (ctx->sync.error_head + ctx->sync.error_count) %
 		   IRL_SYNC_ERROR_SAMPLES;
-	ctx->sync_error_window[tail] = error_ns;
-	ctx->sync_error_time[tail] = now_ns;
-	ctx->sync_error_count++;
+	ctx->sync.error_window[tail] = error_ns;
+	ctx->sync.error_time[tail] = now_ns;
+	ctx->sync.error_count++;
 
 	/* Age out anything past the window. Never empties: the sample just
 	 * pushed is by definition current. */
-	while (ctx->sync_error_count > 1 &&
-	       now_ns - ctx->sync_error_time[ctx->sync_error_head] >
+	while (ctx->sync.error_count > 1 &&
+	       now_ns - ctx->sync.error_time[ctx->sync.error_head] >
 		       IRL_SYNC_ERROR_WINDOW_NS) {
-		ctx->sync_error_head =
-			(ctx->sync_error_head + 1) % IRL_SYNC_ERROR_SAMPLES;
-		ctx->sync_error_count--;
+		ctx->sync.error_head =
+			(ctx->sync.error_head + 1) % IRL_SYNC_ERROR_SAMPLES;
+		ctx->sync.error_count--;
 	}
 
 	int64_t sorted[IRL_SYNC_ERROR_SAMPLES];
-	for (int i = 0; i < ctx->sync_error_count; i++) {
-		sorted[i] = ctx->sync_error_window[(ctx->sync_error_head + i) %
+	for (int i = 0; i < ctx->sync.error_count; i++) {
+		sorted[i] = ctx->sync.error_window[(ctx->sync.error_head + i) %
 						   IRL_SYNC_ERROR_SAMPLES];
 	}
-	qsort(sorted, (size_t)ctx->sync_error_count, sizeof(sorted[0]),
+	qsort(sorted, (size_t)ctx->sync.error_count, sizeof(sorted[0]),
 	      cmp_int64);
 
 	/* A tenth off each end, which is enough to lose a corrupt timecode
@@ -588,11 +588,11 @@ static int64_t error_filter_push(struct irl_source *ctx, int64_t error_ns,
 	 * a feed that has only just started, and one bad sample in three would
 	 * otherwise pass straight through. The count kept is never less than
 	 * one — at three samples this is exactly the median again. */
-	int trim = ctx->sync_error_count / 10;
-	if (trim == 0 && ctx->sync_error_count >= 3)
+	int trim = ctx->sync.error_count / 10;
+	if (trim == 0 && ctx->sync.error_count >= 3)
 		trim = 1;
 
-	const int kept = ctx->sync_error_count - 2 * trim;
+	const int kept = ctx->sync.error_count - 2 * trim;
 	int64_t sum = 0;
 	for (int i = trim; i < trim + kept; i++)
 		sum += sorted[i];
@@ -615,13 +615,13 @@ static void publish(struct irl_source *ctx)
 {
 	struct irl_sync_snapshot snap = {0};
 
-	snap.status = ctx->sync_status;
-	snap.tc_reason = ctx->sync_tc_reason;
-	snap.have_timecode = ctx->sync_have_tc;
-	snap.tc = ctx->sync_tc;
-	snap.latency_ms = ctx->sync_latency_ns / 1000000LL;
-	snap.added_ms = ctx->sync_hold_ns / 1000000LL;
-	snap.error_ms = ctx->sync_error_ns / 1000000LL;
+	snap.status = ctx->sync.status;
+	snap.tc_reason = ctx->sync.tc_reason;
+	snap.have_timecode = ctx->sync.have_tc;
+	snap.tc = ctx->sync.tc;
+	snap.latency_ms = ctx->sync.latency_ns / 1000000LL;
+	snap.added_ms = ctx->sync.hold_ns / 1000000LL;
+	snap.error_ms = ctx->sync.error_ns / 1000000LL;
 
 	int64_t peak_ns = peak_value(ctx);
 	snap.latency_peak_ms = peak_ns / 1000000LL;
@@ -634,53 +634,53 @@ static void publish(struct irl_source *ctx)
 
 void irl_sync_reset(struct irl_source *ctx)
 {
-	delay_clear(&ctx->sync_delay);
+	delay_clear(&ctx->sync.delay);
 
 	irl_mutex_lock(&ctx->audio_state_lock);
-	ctx->sync_present_bias_ns = 0;
-	ctx->sync_present_bias_valid = false;
-	ctx->sync_anchor_defer_ns = 0;
+	ctx->sync.present_bias_ns = 0;
+	ctx->sync.present_bias_valid = false;
+	ctx->sync.anchor_defer_ns = 0;
 	irl_mutex_unlock(&ctx->audio_state_lock);
-	os_atomic_set_bool(&ctx->sync_anchor_defer_pending, false);
+	os_atomic_set_bool(&ctx->sync.anchor_defer_pending, false);
 
-	ctx->sync_engaged = false;
-	ctx->sync_seed_reported = false;
-	ctx->sync_status = IRL_SYNC_OFF;
-	ctx->sync_tc_reason = IRL_SYNC_TC_OK;
-	ctx->sync_have_tc = false;
-	ctx->sync_hold_ns = 0;
-	ctx->sync_latency_ns = 0;
-	ctx->sync_error_ns = 0;
+	ctx->sync.engaged = false;
+	ctx->sync.seed_reported = false;
+	ctx->sync.status = IRL_SYNC_OFF;
+	ctx->sync.tc_reason = IRL_SYNC_TC_OK;
+	ctx->sync.have_tc = false;
+	ctx->sync.hold_ns = 0;
+	ctx->sync.latency_ns = 0;
+	ctx->sync.error_ns = 0;
 	error_filter_reset(ctx);
-	os_atomic_set_bool(&ctx->sync_prime_hold, false);
-	ctx->sync_released_once = false;
-	ctx->sync_prime_deadline_ns = 0;
-	ctx->sync_fps_interval_ns = 0;
-	ctx->sync_fps_next = 0;
-	ctx->sync_fps_count = 0;
-	ctx->sync_tc_max_frames = 0;
-	ctx->sync_tc_second = 0;
-	ctx->sync_tc_have_second = false;
-	ctx->sync_last_tc_ns = 0;
-	ctx->sync_last_adjust_ns = 0;
-	ctx->sync_settle_until_ns = 0;
-	ctx->sync_too_slow_since_ns = 0;
-	ctx->sync_in_reach_since_ns = 0;
-	ctx->sync_applied_offset_ms = 0;
-	ctx->sync_offset_generation = irl_sync_offset_generation();
-	ctx->sync_peak_bucket = 0;
-	ctx->sync_peak_bucket_start_ns = 0;
+	os_atomic_set_bool(&ctx->sync.prime_hold, false);
+	ctx->sync.released_once = false;
+	ctx->sync.prime_deadline_ns = 0;
+	ctx->sync.fps_interval_ns = 0;
+	ctx->sync.fps_next = 0;
+	ctx->sync.fps_count = 0;
+	ctx->sync.tc_max_frames = 0;
+	ctx->sync.tc_second = 0;
+	ctx->sync.tc_have_second = false;
+	ctx->sync.last_tc_ns = 0;
+	ctx->sync.last_adjust_ns = 0;
+	ctx->sync.settle_until_ns = 0;
+	ctx->sync.too_slow_since_ns = 0;
+	ctx->sync.in_reach_since_ns = 0;
+	ctx->sync.applied_offset_ms = 0;
+	ctx->sync.offset_generation = irl_sync_offset_generation();
+	ctx->sync.peak_bucket = 0;
+	ctx->sync.peak_bucket_start_ns = 0;
 	for (int i = 0; i < IRL_SYNC_PEAK_BUCKETS; i++)
-		ctx->sync_peak_buckets[i] = INT64_MIN;
+		ctx->sync.peak_buckets[i] = INT64_MIN;
 
 	publish(ctx);
 }
 
 void irl_sync_free(struct irl_source *ctx)
 {
-	delay_clear(&ctx->sync_delay);
-	bfree(ctx->sync_delay.entries);
-	ctx->sync_delay.entries = NULL;
+	delay_clear(&ctx->sync.delay);
+	bfree(ctx->sync.delay.entries);
+	ctx->sync.delay.entries = NULL;
 }
 
 /* ── Control loop ─────────────────────────────────────────── */
@@ -695,21 +695,21 @@ static bool sync_wanted(const struct irl_source *ctx)
  * downstream can absorb. See SYNC_RELEASE_RATE. */
 static void release_hold(struct irl_source *ctx, uint64_t now_ns)
 {
-	if (ctx->sync_hold_ns <= 0) {
-		ctx->sync_hold_ns = 0;
-		ctx->sync_last_adjust_ns = now_ns;
+	if (ctx->sync.hold_ns <= 0) {
+		ctx->sync.hold_ns = 0;
+		ctx->sync.last_adjust_ns = now_ns;
 		return;
 	}
 
-	int64_t elapsed_ns = ctx->sync_last_adjust_ns
-				     ? (int64_t)(now_ns - ctx->sync_last_adjust_ns)
+	int64_t elapsed_ns = ctx->sync.last_adjust_ns
+				     ? (int64_t)(now_ns - ctx->sync.last_adjust_ns)
 				     : 0;
-	ctx->sync_last_adjust_ns = now_ns;
+	ctx->sync.last_adjust_ns = now_ns;
 
 	int64_t step_ns = (int64_t)((double)elapsed_ns * SYNC_RELEASE_RATE);
-	ctx->sync_hold_ns -= step_ns;
-	if (ctx->sync_hold_ns < 0)
-		ctx->sync_hold_ns = 0;
+	ctx->sync.hold_ns -= step_ns;
+	if (ctx->sync.hold_ns < 0)
+		ctx->sync.hold_ns = 0;
 }
 
 /* Classify, with the alarm hysteresis applied. */
@@ -717,34 +717,34 @@ static void update_status(struct irl_source *ctx, uint64_t now_ns,
 			  bool reachable)
 {
 	if (reachable) {
-		ctx->sync_too_slow_since_ns = 0;
-		if (ctx->sync_in_reach_since_ns == 0)
-			ctx->sync_in_reach_since_ns = now_ns;
+		ctx->sync.too_slow_since_ns = 0;
+		if (ctx->sync.in_reach_since_ns == 0)
+			ctx->sync.in_reach_since_ns = now_ns;
 	} else {
-		ctx->sync_in_reach_since_ns = 0;
-		if (ctx->sync_too_slow_since_ns == 0)
-			ctx->sync_too_slow_since_ns = now_ns;
+		ctx->sync.in_reach_since_ns = 0;
+		if (ctx->sync.too_slow_since_ns == 0)
+			ctx->sync.too_slow_since_ns = now_ns;
 	}
 
-	bool alarmed = ctx->sync_status == IRL_SYNC_TOO_SLOW;
+	bool alarmed = ctx->sync.status == IRL_SYNC_TOO_SLOW;
 
 	if (!alarmed && !reachable &&
-	    now_ns - ctx->sync_too_slow_since_ns >= SYNC_ALARM_ENTER_NS) {
+	    now_ns - ctx->sync.too_slow_since_ns >= SYNC_ALARM_ENTER_NS) {
 		alarmed = true;
 		blog(LOG_WARNING,
 		     "[irl-source] Sync: feed arrives %lldms late, past the %dms offset; raise the offset to at least %lldms",
-		     (long long)(ctx->sync_latency_ns / 1000000LL),
+		     (long long)(ctx->sync.latency_ns / 1000000LL),
 		     irl_sync_offset_ms(),
 		     (long long)required_offset_ms(peak_value(ctx) / 1000000LL));
 	} else if (alarmed && reachable &&
-		   now_ns - ctx->sync_in_reach_since_ns >= SYNC_ALARM_LEAVE_NS) {
+		   now_ns - ctx->sync.in_reach_since_ns >= SYNC_ALARM_LEAVE_NS) {
 		alarmed = false;
 		blog(LOG_INFO,
 		     "[irl-source] Sync: feed back within the offset");
 	}
 
 	if (alarmed) {
-		ctx->sync_status = IRL_SYNC_TOO_SLOW;
+		ctx->sync.status = IRL_SYNC_TOO_SLOW;
 		return;
 	}
 
@@ -753,21 +753,21 @@ static void update_status(struct irl_source *ctx, uint64_t now_ns,
 	 * sync_error_ns is still the 0 it was reset to — which would otherwise
 	 * be inside the lock tolerance and report Locked for the several
 	 * seconds the line is filling. */
-	if (ctx->sync_error_count == 0) {
-		ctx->sync_locked = false;
-		ctx->sync_status = IRL_SYNC_ACQUIRING;
+	if (ctx->sync.error_count == 0) {
+		ctx->sync.locked = false;
+		ctx->sync.status = IRL_SYNC_ACQUIRING;
 		return;
 	}
 
-	int64_t err = llabs(ctx->sync_error_ns);
-	if (ctx->sync_locked) {
+	int64_t err = llabs(ctx->sync.error_ns);
+	if (ctx->sync.locked) {
 		if (err > SYNC_UNLOCK_TOLERANCE_NS)
-			ctx->sync_locked = false;
+			ctx->sync.locked = false;
 	} else if (err <= SYNC_LOCK_TOLERANCE_NS) {
-		ctx->sync_locked = true;
+		ctx->sync.locked = true;
 	}
 
-	ctx->sync_status = ctx->sync_locked ? IRL_SYNC_LOCKED
+	ctx->sync.status = ctx->sync.locked ? IRL_SYNC_LOCKED
 					    : IRL_SYNC_ACQUIRING;
 }
 
@@ -793,13 +793,13 @@ static void observe_timecode(struct irl_source *ctx, const AVPacket *pkt,
 		 * staleness clock fed, but measure nothing: a guess here would
 		 * seed the hold wrong and sit in the latency peak for a minute
 		 * afterwards. */
-		ctx->sync_tc = *tc;
-		ctx->sync_have_tc = true;
-		ctx->sync_last_tc_ns = now_ns;
+		ctx->sync.tc = *tc;
+		ctx->sync.have_tc = true;
+		ctx->sync.last_tc_ns = now_ns;
 		if (!control)
 			return;
 		set_tc_reason(ctx, IRL_SYNC_TC_OK);
-		ctx->sync_status = IRL_SYNC_ACQUIRING;
+		ctx->sync.status = IRL_SYNC_ACQUIRING;
 		return;
 	}
 
@@ -809,15 +809,15 @@ static void observe_timecode(struct irl_source *ctx, const AVPacket *pkt,
 		 * compare them against, so nothing can be aligned. */
 		if (!control)
 			return;
-		ctx->sync_status = IRL_SYNC_NO_TIMECODE;
+		ctx->sync.status = IRL_SYNC_NO_TIMECODE;
 		set_tc_reason(ctx, IRL_SYNC_TC_NO_CLOCK);
 		return;
 	}
 
-	ctx->sync_tc = *tc;
-	ctx->sync_have_tc = true;
-	ctx->sync_last_tc_ns = now_ns;
-	ctx->sync_latency_ns = latency_ns;
+	ctx->sync.tc = *tc;
+	ctx->sync.have_tc = true;
+	ctx->sync.last_tc_ns = now_ns;
+	ctx->sync.latency_ns = latency_ns;
 	peak_record(ctx, latency_ns, now_ns);
 
 	if (!control)
@@ -825,10 +825,10 @@ static void observe_timecode(struct irl_source *ctx, const AVPacket *pkt,
 
 	set_tc_reason(ctx, IRL_SYNC_TC_OK);
 
-	const int64_t prev_hold_ns = ctx->sync_hold_ns;
+	const int64_t prev_hold_ns = ctx->sync.hold_ns;
 	const int64_t elapsed_ns =
-		ctx->sync_last_adjust_ns
-			? (int64_t)(now_ns - ctx->sync_last_adjust_ns)
+		ctx->sync.last_adjust_ns
+			? (int64_t)(now_ns - ctx->sync.last_adjust_ns)
 			: 0;
 
 	int64_t offset_ns = (int64_t)irl_sync_offset_ms() * 1000000LL;
@@ -840,16 +840,16 @@ static void observe_timecode(struct irl_source *ctx, const AVPacket *pkt,
 	 * that would starve the decoder. The nominal pipeline delay is the
 	 * jitter cushion; the rest of the error is what the loop below is for,
 	 * biased onto the cheap side of zero. See SYNC_SEED_BIAS_NS. */
-	if (!ctx->sync_engaged) {
+	if (!ctx->sync.engaged) {
 		int64_t nominal_pipeline_ns =
 			os_atomic_load_long(&ctx->config.buffer_target_ms) *
 			1000000LL;
 
-		ctx->sync_hold_ns = needed_ns - nominal_pipeline_ns +
+		ctx->sync.hold_ns = needed_ns - nominal_pipeline_ns +
 				    SYNC_SEED_BIAS_NS;
-		if (ctx->sync_hold_ns < 0)
-			ctx->sync_hold_ns = 0;
-		ctx->sync_seed_reported = false;
+		if (ctx->sync.hold_ns < 0)
+			ctx->sync.hold_ns = 0;
+		ctx->sync.seed_reported = false;
 
 		/* Hold off measuring until the line has filled and the first
 		 * packets have come out the far end. Engage takes the delay
@@ -858,28 +858,28 @@ static void observe_timecode(struct irl_source *ctx, const AVPacket *pkt,
 		 * long, and every reading before then describes a pipeline
 		 * that is not running yet. Without this the loop corrected in
 		 * the same call that engaged. */
-		ctx->sync_settle_until_ns = now_ns +
-					    (uint64_t)ctx->sync_hold_ns +
+		ctx->sync.settle_until_ns = now_ns +
+					    (uint64_t)ctx->sync.hold_ns +
 					    SYNC_SETTLE_MARGIN_NS;
-		ctx->sync_engaged = true;
-		ctx->sync_locked = false;
-		ctx->sync_applied_offset_ms = irl_sync_offset_ms();
-		ctx->sync_offset_generation = irl_sync_offset_generation();
+		ctx->sync.engaged = true;
+		ctx->sync.locked = false;
+		ctx->sync.applied_offset_ms = irl_sync_offset_ms();
+		ctx->sync.offset_generation = irl_sync_offset_generation();
 		error_filter_reset(ctx);
 
 		/* Now that the hold is known, the priming gate can be given the
 		 * time it actually needs: the line goes quiet for the length of
 		 * the hold before its first release. The initial deadline only
 		 * ever covered "will this source engage at all". */
-		ctx->sync_prime_deadline_ns = now_ns +
-					      (uint64_t)ctx->sync_hold_ns +
+		ctx->sync.prime_deadline_ns = now_ns +
+					      (uint64_t)ctx->sync.hold_ns +
 					      SYNC_PRIME_WAIT_NS;
 
 		blog(LOG_INFO,
 		     "[irl-source] Sync engaged: %.2ffps (from %s), feed latency %lldms, offset %dms, holding %lldms (%lldms of that is seed bias)",
 		     1000000000.0 / (double)frame_interval_ns, interval_origin,
 		     (long long)(latency_ns / 1000000LL), irl_sync_offset_ms(),
-		     (long long)(ctx->sync_hold_ns / 1000000LL),
+		     (long long)(ctx->sync.hold_ns / 1000000LL),
 		     (long long)(SYNC_SEED_BIAS_NS / 1000000LL));
 	}
 
@@ -887,14 +887,14 @@ static void observe_timecode(struct irl_source *ctx, const AVPacket *pkt,
 	 * slewing: they asked for the change and expect a hitch, and slewing
 	 * several seconds at the drift rate would take a minute. */
 	uint32_t generation = irl_sync_offset_generation();
-	if (generation != ctx->sync_offset_generation) {
+	if (generation != ctx->sync.offset_generation) {
 		int64_t delta_ns = ((int64_t)irl_sync_offset_ms() -
-				    ctx->sync_applied_offset_ms) *
+				    ctx->sync.applied_offset_ms) *
 				   1000000LL;
-		ctx->sync_hold_ns += delta_ns;
-		ctx->sync_applied_offset_ms = irl_sync_offset_ms();
-		ctx->sync_offset_generation = generation;
-		ctx->sync_locked = false;
+		ctx->sync.hold_ns += delta_ns;
+		ctx->sync.applied_offset_ms = irl_sync_offset_ms();
+		ctx->sync.offset_generation = generation;
+		ctx->sync.locked = false;
 		/* The target just moved by seconds. Every sample in the window
 		 * describes the old one, and an average of stale readings would
 		 * hold the loop back from a change the user asked for. */
@@ -927,19 +927,19 @@ static void observe_timecode(struct irl_source *ctx, const AVPacket *pkt,
 	if (have_pts) {
 		const int64_t raw_ns = target_ns - pts_ns;
 		irl_mutex_lock(&ctx->audio_state_lock);
-		ctx->sync_present_bias_ns =
-			ctx->sync_present_bias_valid
-				? ctx->sync_present_bias_ns +
-					  (raw_ns - ctx->sync_present_bias_ns) / 8
+		ctx->sync.present_bias_ns =
+			ctx->sync.present_bias_valid
+				? ctx->sync.present_bias_ns +
+					  (raw_ns - ctx->sync.present_bias_ns) / 8
 				: raw_ns;
-		ctx->sync_present_bias_valid = true;
+		ctx->sync.present_bias_valid = true;
 		irl_mutex_unlock(&ctx->audio_state_lock);
 	}
 
 	int64_t presentation_ns;
 	if (have_pts &&
 	    predict_presentation_ns(ctx, pts_ns, &presentation_ns)) {
-		ctx->sync_error_ns = error_filter_push(
+		ctx->sync.error_ns = error_filter_push(
 			ctx, presentation_ns - target_ns, now_ns);
 
 		/* Wait for the last correction to reach the measurement before
@@ -955,7 +955,7 @@ static void observe_timecode(struct irl_source *ctx, const AVPacket *pkt,
 		 * ceiling within a fraction of a second, leaving the stream
 		 * tens of seconds behind. One correction per settling
 		 * interval converges geometrically instead. */
-		if (now_ns >= ctx->sync_settle_until_ns) {
+		if (now_ns >= ctx->sync.settle_until_ns) {
 			/* Positive error means we are late, so hold less.
 			 * Unlocked the correction is applied outright —
 			 * nothing is aligned yet, so there is no smoothness to
@@ -963,8 +963,8 @@ static void observe_timecode(struct irl_source *ctx, const AVPacket *pkt,
 			 * step safe. Once locked it is rate limited, which
 			 * keeps the resulting playback trim inside the speed
 			 * controller's inaudible band. */
-			int64_t step_ns = -ctx->sync_error_ns;
-			if (ctx->sync_locked) {
+			int64_t step_ns = -ctx->sync.error_ns;
+			if (ctx->sync.locked) {
 				int64_t limit_ns = (int64_t)(
 					(double)elapsed_ns * SYNC_SLEW_RATE);
 				if (step_ns > limit_ns)
@@ -973,20 +973,20 @@ static void observe_timecode(struct irl_source *ctx, const AVPacket *pkt,
 					step_ns = -limit_ns;
 			}
 
-			ctx->sync_hold_ns += step_ns;
-			ctx->sync_last_adjust_ns = now_ns;
+			ctx->sync.hold_ns += step_ns;
+			ctx->sync.last_adjust_ns = now_ns;
 
 			/* The first reading after engage is how far the seed
 			 * actually missed, and its sign says whether the bias
 			 * is doing its job: positive means the source started
 			 * late, which is the direction that corrects at +5%.
 			 * Said once per engage, so it costs nothing. */
-			if (!ctx->sync_seed_reported) {
-				ctx->sync_seed_reported = true;
+			if (!ctx->sync.seed_reported) {
+				ctx->sync.seed_reported = true;
 				blog(LOG_INFO,
 				     "[irl-source] Sync seed missed by %lldms (%s); correcting",
-				     (long long)(ctx->sync_error_ns / 1000000LL),
-				     ctx->sync_error_ns >= 0 ? "late, fast to fix"
+				     (long long)(ctx->sync.error_ns / 1000000LL),
+				     ctx->sync.error_ns >= 0 ? "late, fast to fix"
 							     : "early, slow to fix");
 			}
 		}
@@ -1010,10 +1010,10 @@ static void observe_timecode(struct irl_source *ctx, const AVPacket *pkt,
 				      ? needed_ns + SYNC_SEED_BIAS_NS +
 						SYNC_ANCHOR_MAX_WAIT_NS
 				      : 0;
-	if (ctx->sync_hold_ns > max_hold_ns)
-		ctx->sync_hold_ns = max_hold_ns;
-	if (ctx->sync_hold_ns < 0)
-		ctx->sync_hold_ns = 0;
+	if (ctx->sync.hold_ns > max_hold_ns)
+		ctx->sync.hold_ns = max_hold_ns;
+	if (ctx->sync.hold_ns < 0)
+		ctx->sync.hold_ns = 0;
 
 	/* The one invariant that keeps every path above safe, and deliberately
 	 * applied last so the ceiling cannot bypass it: the hold may grow as
@@ -1026,20 +1026,20 @@ static void observe_timecode(struct irl_source *ctx, const AVPacket *pkt,
 	 * drain instead. */
 	int64_t floor_ns = prev_hold_ns -
 			   (int64_t)((double)elapsed_ns * SYNC_RELEASE_RATE);
-	if (ctx->sync_hold_ns < floor_ns)
-		ctx->sync_hold_ns = floor_ns;
-	if (ctx->sync_hold_ns < 0)
-		ctx->sync_hold_ns = 0;
+	if (ctx->sync.hold_ns < floor_ns)
+		ctx->sync.hold_ns = floor_ns;
+	if (ctx->sync.hold_ns < 0)
+		ctx->sync.hold_ns = 0;
 
 	/* Arm the gate whenever the hold actually moved. A change takes the
 	 * larger of the old and new holds to work through the line — packets
 	 * already queued drain at their existing release times — plus the rest
 	 * of the pipeline. */
-	if (ctx->sync_hold_ns != prev_hold_ns) {
-		int64_t propagation_ns = ctx->sync_hold_ns > prev_hold_ns
-						 ? ctx->sync_hold_ns
+	if (ctx->sync.hold_ns != prev_hold_ns) {
+		int64_t propagation_ns = ctx->sync.hold_ns > prev_hold_ns
+						 ? ctx->sync.hold_ns
 						 : prev_hold_ns;
-		ctx->sync_settle_until_ns =
+		ctx->sync.settle_until_ns =
 			now_ns + (uint64_t)propagation_ns +
 			SYNC_SETTLE_MARGIN_NS;
 	}
@@ -1064,20 +1064,20 @@ static void update_prime_gate(struct irl_source *ctx, uint64_t now_ns)
 	/* A source already arriving late enough for the offset needs no hold,
 	 * so the line never queues anything and there is no first release to
 	 * wait for. It is flowing the moment it engages. */
-	bool flowing = ctx->sync_released_once ||
-		       (ctx->sync_engaged && ctx->sync_hold_ns <= 0);
+	bool flowing = ctx->sync.released_once ||
+		       (ctx->sync.engaged && ctx->sync.hold_ns <= 0);
 
 	bool hold = sync_wanted(ctx) && !flowing &&
-		    ctx->sync_status != IRL_SYNC_NO_TIMECODE &&
-		    now_ns < ctx->sync_prime_deadline_ns;
+		    ctx->sync.status != IRL_SYNC_NO_TIMECODE &&
+		    now_ns < ctx->sync.prime_deadline_ns;
 
-	if (hold != os_atomic_load_bool(&ctx->sync_prime_hold))
-		os_atomic_set_bool(&ctx->sync_prime_hold, hold);
+	if (hold != os_atomic_load_bool(&ctx->sync.prime_hold))
+		os_atomic_set_bool(&ctx->sync.prime_hold, hold);
 }
 
 bool irl_sync_prime_held(struct irl_source *ctx)
 {
-	return os_atomic_load_bool(&ctx->sync_prime_hold);
+	return os_atomic_load_bool(&ctx->sync.prime_hold);
 }
 
 bool irl_sync_playout_anchor(struct irl_source *ctx, int64_t pts_ns,
@@ -1087,8 +1087,8 @@ bool irl_sync_playout_anchor(struct irl_source *ctx, int64_t pts_ns,
 		return false;
 
 	irl_mutex_lock(&ctx->audio_state_lock);
-	const bool valid = ctx->sync_present_bias_valid;
-	const int64_t bias_ns = ctx->sync_present_bias_ns;
+	const bool valid = ctx->sync.present_bias_valid;
+	const int64_t bias_ns = ctx->sync.present_bias_ns;
 	irl_mutex_unlock(&ctx->audio_state_lock);
 
 	if (!valid)
@@ -1103,9 +1103,9 @@ bool irl_sync_playout_anchor(struct irl_source *ctx, int64_t pts_ns,
 
 	/* Hand the wait back so the delay line can absorb it. */
 	irl_mutex_lock(&ctx->audio_state_lock);
-	ctx->sync_anchor_defer_ns = wait_ns;
+	ctx->sync.anchor_defer_ns = wait_ns;
 	irl_mutex_unlock(&ctx->audio_state_lock);
-	os_atomic_set_bool(&ctx->sync_anchor_defer_pending, true);
+	os_atomic_set_bool(&ctx->sync.anchor_defer_pending, true);
 
 	*anchor_ns = (uint64_t)placed_ns;
 	return true;
@@ -1125,33 +1125,33 @@ bool irl_sync_playout_anchor(struct irl_source *ctx, int64_t pts_ns,
  * yet: the gap this opens is one the output is already waiting through. */
 static void apply_anchor_defer(struct irl_source *ctx, uint64_t now_ns)
 {
-	if (!os_atomic_load_bool(&ctx->sync_anchor_defer_pending))
+	if (!os_atomic_load_bool(&ctx->sync.anchor_defer_pending))
 		return;
 
 	irl_mutex_lock(&ctx->audio_state_lock);
-	const int64_t defer_ns = ctx->sync_anchor_defer_ns;
-	ctx->sync_anchor_defer_ns = 0;
+	const int64_t defer_ns = ctx->sync.anchor_defer_ns;
+	ctx->sync.anchor_defer_ns = 0;
 	irl_mutex_unlock(&ctx->audio_state_lock);
-	os_atomic_set_bool(&ctx->sync_anchor_defer_pending, false);
+	os_atomic_set_bool(&ctx->sync.anchor_defer_pending, false);
 
 	if (defer_ns <= 0)
 		return;
 
-	ctx->sync_hold_ns += defer_ns;
-	delay_shift_later(&ctx->sync_delay, defer_ns);
+	ctx->sync.hold_ns += defer_ns;
+	delay_shift_later(&ctx->sync.delay, defer_ns);
 
 	/* The queued packets moved with the hold, so this change is already at
 	 * the line's output rather than a hold away from it. The gate only has
 	 * to cover the rest of the pipeline. */
-	ctx->sync_settle_until_ns = now_ns + SYNC_SETTLE_MARGIN_NS;
+	ctx->sync.settle_until_ns = now_ns + SYNC_SETTLE_MARGIN_NS;
 
 	blog(LOG_INFO,
 	     "[irl-source] Sync: delay line took over the %lldms pre-roll; holding %lldms",
 	     (long long)(defer_ns / 1000000LL),
-	     (long long)(ctx->sync_hold_ns / 1000000LL));
+	     (long long)(ctx->sync.hold_ns / 1000000LL));
 }
 
-void irl_sync_observe(struct irl_source *ctx, const AVPacket *pkt)
+static void observe(struct irl_source *ctx, const AVPacket *pkt)
 {
 	uint64_t now_ns = os_gettime_ns();
 
@@ -1160,8 +1160,8 @@ void irl_sync_observe(struct irl_source *ctx, const AVPacket *pkt)
 	/* First packet of the stream: start the clock the gate runs against.
 	 * Here rather than in irl_sync_reset because reset has no `now`, and
 	 * nothing can prime before a packet has been read anyway. */
-	if (ctx->sync_prime_deadline_ns == 0)
-		ctx->sync_prime_deadline_ns = now_ns + SYNC_PRIME_WAIT_NS;
+	if (ctx->sync.prime_deadline_ns == 0)
+		ctx->sync.prime_deadline_ns = now_ns + SYNC_PRIME_WAIT_NS;
 
 	/* Whether the controller may act. Reading the timecodes does not
 	 * depend on it: a source that is switched off still reports what it is
@@ -1169,11 +1169,11 @@ void irl_sync_observe(struct irl_source *ctx, const AVPacket *pkt)
 	 * stamping from one that is and simply has not been turned on yet. */
 	const bool control = sync_wanted(ctx);
 
-	if (!control && ctx->sync_status != IRL_SYNC_OFF) {
-		ctx->sync_status = IRL_SYNC_OFF;
-		ctx->sync_tc_reason = IRL_SYNC_TC_OK;
-		ctx->sync_error_ns = 0;
-		ctx->sync_locked = false;
+	if (!control && ctx->sync.status != IRL_SYNC_OFF) {
+		ctx->sync.status = IRL_SYNC_OFF;
+		ctx->sync.tc_reason = IRL_SYNC_TC_OK;
+		ctx->sync.error_ns = 0;
+		ctx->sync.locked = false;
 	}
 
 	if (pkt->stream_index == ctx->video_stream_idx && pkt->data &&
@@ -1192,45 +1192,45 @@ void irl_sync_observe(struct irl_source *ctx, const AVPacket *pkt)
 	/* No timecode for a while: either the sender never sends them or it
 	 * stopped. Both leave the source unalignable, and the delay line has
 	 * to let go rather than hold a stale amount forever. */
-	if (ctx->sync_last_tc_ns == 0 ||
-	    now_ns - ctx->sync_last_tc_ns > SYNC_TC_STALE_NS) {
-		if (control && ctx->sync_status != IRL_SYNC_NO_TIMECODE) {
-			ctx->sync_status = IRL_SYNC_NO_TIMECODE;
-			ctx->sync_error_ns = 0;
-			ctx->sync_locked = false;
+	if (ctx->sync.last_tc_ns == 0 ||
+	    now_ns - ctx->sync.last_tc_ns > SYNC_TC_STALE_NS) {
+		if (control && ctx->sync.status != IRL_SYNC_NO_TIMECODE) {
+			ctx->sync.status = IRL_SYNC_NO_TIMECODE;
+			ctx->sync.error_ns = 0;
+			ctx->sync.locked = false;
 		}
 		if (control)
 			set_tc_reason(ctx, diagnose_missing_timecode(ctx));
 		/* Nothing left to display either, so the stamp goes with it —
 		 * a frozen timecode is worse than none. */
-		ctx->sync_have_tc = false;
+		ctx->sync.have_tc = false;
 		give_back_hold = true;
 	}
 
 	if (give_back_hold) {
-		ctx->sync_engaged = false;
+		ctx->sync.engaged = false;
 		release_hold(ctx, now_ns);
 	}
 
 	update_prime_gate(ctx, now_ns);
 
 	/* ~5Hz is plenty for a dock and keeps this off the per-packet path. */
-	if (now_ns - ctx->sync_publish_ns >= 200000000ULL) {
-		ctx->sync_publish_ns = now_ns;
+	if (now_ns - ctx->sync.publish_ns >= 200000000ULL) {
+		ctx->sync.publish_ns = now_ns;
 		publish(ctx);
 	}
 }
 
-bool irl_sync_hold(struct irl_source *ctx, AVPacket *pkt)
+static bool hold(struct irl_source *ctx, AVPacket *pkt)
 {
-	if (ctx->sync_hold_ns <= 0 && ctx->sync_delay.count == 0)
+	if (ctx->sync.hold_ns <= 0 && ctx->sync.delay.count == 0)
 		return false;
 
 	/* Once anything is queued, everything must queue behind it or the
 	 * decoder would see packets out of order. */
-	uint64_t release_ns = os_gettime_ns() + (uint64_t)ctx->sync_hold_ns;
+	uint64_t release_ns = os_gettime_ns() + (uint64_t)ctx->sync.hold_ns;
 
-	if (delay_push(&ctx->sync_delay, pkt, release_ns))
+	if (delay_push(&ctx->sync.delay, pkt, release_ns))
 		return true;
 
 	/* A ceiling reached despite the receiver loop's backpressure, or an
@@ -1239,22 +1239,43 @@ bool irl_sync_hold(struct irl_source *ctx, AVPacket *pkt)
 	 * cost reference frames until the next keyframe. Reported rather than
 	 * absorbed silently, because it means sync is no longer holding what it
 	 * claims to. */
-	if (ctx->sync_delay.overflows++ == 0) {
+	if (ctx->sync.delay.overflows++ == 0) {
 		blog(LOG_WARNING,
 		     "[irl-source] Sync delay line could not take a packet (%d queued, %zu bytes); alignment will drift until it recovers",
-		     ctx->sync_delay.count, ctx->sync_delay.bytes);
+		     ctx->sync.delay.count, ctx->sync.delay.bytes);
 	}
 	return false;
 }
 
-bool irl_sync_delay_full(const struct irl_source *ctx)
+static bool delay_at_ceiling(const struct irl_source *ctx)
 {
-	return delay_full(&ctx->sync_delay);
+	return delay_full(&ctx->sync.delay);
+}
+
+bool irl_sync_intercept(struct irl_source *ctx, AVPacket *pkt)
+{
+	observe(ctx, pkt);
+	return hold(ctx, pkt);
+}
+
+bool irl_sync_wait_for_room(struct irl_source *ctx, AVFrame *frame)
+{
+	/* Draining inside the wait is what makes the room, so this cannot
+	 * deadlock while packets are becoming due. Stopping reading is the
+	 * point: the excess ends up held by the transport — TCP backpressure,
+	 * or SRT's own latency window — rather than by this process. */
+	while (os_atomic_load_bool(&ctx->thread_active) &&
+	       delay_at_ceiling(ctx)) {
+		irl_sync_drain(ctx, frame);
+		os_sleep_ms(2);
+	}
+
+	return os_atomic_load_bool(&ctx->thread_active);
 }
 
 void irl_sync_drain(struct irl_source *ctx, AVFrame *frame)
 {
-	struct irl_packet_delay *delay = &ctx->sync_delay;
+	struct irl_packet_delay *delay = &ctx->sync.delay;
 	uint64_t now_ns = os_gettime_ns();
 
 	while (delay->count > 0) {
@@ -1274,6 +1295,6 @@ void irl_sync_drain(struct irl_source *ctx, AVFrame *frame)
 
 		/* The line has started flowing again, which is the condition
 		 * the priming gate is really waiting on. */
-		ctx->sync_released_once = true;
+		ctx->sync.released_once = true;
 	}
 }

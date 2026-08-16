@@ -102,16 +102,8 @@ void *irl_receiver_thread(void *data)
 				break;
 		}
 
-		/* Sync delay line at its ceiling: stop reading and let the
-		 * transport hold the excess, exactly as the audio bleed pace
-		 * above does. Draining inside the wait is what makes room, so
-		 * this cannot deadlock while packets are becoming due. */
-		while (os_atomic_load_bool(&ctx->thread_active) &&
-		       irl_sync_delay_full(ctx)) {
-			irl_sync_drain(ctx, frame);
-			os_sleep_ms(2);
-		}
-		if (!os_atomic_load_bool(&ctx->thread_active))
+		/* ── timecode sync ── */
+		if (!irl_sync_wait_for_room(ctx, frame))
 			break;
 
 		ctx->io_start_us = (uint64_t)av_gettime();
@@ -121,11 +113,12 @@ void *irl_receiver_thread(void *data)
 			continue;
 		}
 
-		irl_sync_observe(ctx, pkt);
-		if (!irl_sync_hold(ctx, pkt))
+		/* ── timecode sync ── */
+		if (!irl_sync_intercept(ctx, pkt))
 			irl_dispatch_packet(ctx, pkt, frame);
 
 		av_packet_unref(pkt);
+		/* ── timecode sync ── */
 		irl_sync_drain(ctx, frame);
 		irl_log_receiver_stats(ctx);
 	}

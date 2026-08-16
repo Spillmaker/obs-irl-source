@@ -5,7 +5,7 @@
  * Copyright (C) 2026 Thomas Lekanger
  * SPDX-License-Identifier: AGPL-3.0-or-later
  *
- * ntp-client.c — SNTP (RFC 4330) client for timecode sync.
+ * sync-ntp.c — SNTP (RFC 4330) client for timecode sync.
  *
  * Deliberately small: one UDP round trip, four timestamps, the classic
  * offset/delay pair. No stepping of anything system-wide — the result is an
@@ -46,8 +46,8 @@ typedef int irl_socket_t;
 #include <util/platform.h>
 #include <util/threading.h>
 
-#include "../include/irl-ntp.h"
-#include "../include/irl-threading.h"
+#include "../../include/sync/irl-ntp.h"
+#include "../../include/irl-threading.h"
 
 /* Seconds between 1900-01-01 (NTP epoch) and 1970-01-01 (Unix epoch). */
 #define NTP_UNIX_EPOCH_DELTA 2208988800ULL

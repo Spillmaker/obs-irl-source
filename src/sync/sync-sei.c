@@ -5,7 +5,7 @@
  * Copyright (C) 2026 Thomas Lekanger
  * SPDX-License-Identifier: AGPL-3.0-or-later
  *
- * sei-timecode.c — HEVC time_code SEI extraction (ITU-T H.265 D.2.27).
+ * sync-sei.c — HEVC time_code SEI extraction (ITU-T H.265 D.2.27).
  *
  * Parsed here rather than taken from FFmpeg's AV_FRAME_DATA_S12M_TIMECODE
  * side data, which the HEVC decoder does produce for this payload. That side
@@ -20,7 +20,7 @@
 
 #include <string.h>
 
-#include "../include/irl-sei.h"
+#include "../../include/sync/irl-sei.h"
 
 #define HEVC_NAL_PREFIX_SEI_NUT 39
 #define HEVC_SEI_TYPE_TIME_CODE 136

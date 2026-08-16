@@ -604,6 +604,7 @@ static uint64_t audio_fresh_anchor_ns(struct irl_source *ctx, int64_t peek_ns,
 				      bool *placed)
 {
 	uint64_t anchor_ns = now + chunk_ns;
+	/* ── timecode sync ── */
 	const bool ok =
 		irl_sync_playout_anchor(ctx, peek_ns, now, &anchor_ns);
 
@@ -826,6 +827,7 @@ bool irl_pump_audio_once(struct irl_source *ctx)
 		 * starves it; priming after costs nothing, because nothing is
 		 * playing yet. Bounded by a deadline on the other side, so a
 		 * feed that can never sync still gets audio. */
+		/* ── timecode sync ── */
 		if (irl_sync_prime_held(ctx))
 			return false;
 

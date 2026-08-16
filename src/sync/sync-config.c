@@ -5,7 +5,7 @@
  * Copyright (C) 2026 Thomas Lekanger
  * SPDX-License-Identifier: AGPL-3.0-or-later
  *
- * sync-group.c — global sync settings and the source registry behind them.
+ * sync-config.c — global sync settings and the source registry behind them.
  *
  * Nothing here is on the audio or video path. The receiver threads read the
  * two atomics at the top of this file and publish a small snapshot; the
@@ -21,10 +21,10 @@
 #include <util/platform.h>
 #include <util/threading.h>
 
-#include "../include/irl-source.h"
-#include "../include/irl-ntp.h"
-#include "../include/irl-sync.h"
-#include "../include/irl-threading.h"
+#include "../../include/irl-source.h"
+#include "../../include/sync/irl-ntp.h"
+#include "../../include/sync/irl-sync.h"
+#include "../../include/irl-threading.h"
 
 #define SYNC_CONFIG_FILE "sync.json"
 
@@ -376,7 +376,7 @@ bool irl_sync_get_snapshot(struct irl_source *ctx,
 
 /* ── Lifecycle ────────────────────────────────────────────── */
 
-void irl_sync_init(void)
+static void sync_init(void)
 {
 	if (sync.initialised)
 		return;
@@ -401,11 +401,207 @@ void irl_sync_init(void)
 	irl_ntp_set_enabled(true);
 }
 
-void irl_sync_shutdown(void)
+static void sync_shutdown(void)
 {
 	if (!sync.initialised)
 		return;
 
 	irl_mutex_destroy(&sync.lock);
 	sync.initialised = false;
+}
+
+/* ── Module lifecycle ─────────────────────────────────────── */
+
+void irl_sync_module_load(void)
+{
+	/* Ordering: the NTP client has to exist before the settings are
+	 * loaded, because loading them applies the configured server to it. */
+	irl_ntp_start();
+	sync_init();
+}
+
+void irl_sync_module_post_load(void)
+{
+#ifdef IRL_ENABLE_DOCK
+	irl_sync_dock_register();
+#endif
+}
+
+void irl_sync_module_unload(void)
+{
+#ifdef IRL_ENABLE_DOCK
+	irl_sync_dock_unregister();
+#endif
+	irl_ntp_stop();
+	sync_shutdown();
+}
+
+/* ── Per-source settings ──────────────────────────────────── */
+
+/* The one thing about sync that belongs on a source rather than in the dock:
+ * whether this feed takes part. Everything else — the master switch, the
+ * offset, the server — is shared by every source and every OBS instance, so it
+ * lives in the dock and in this file's config store, not in the scene
+ * collection.
+ *
+ * Both of these are called from settings.c, which is the whole of the
+ * feature's presence in the plugin's own properties. */
+void irl_sync_source_defaults(obs_data_t *settings)
+{
+	obs_data_set_default_bool(settings, "sync_enabled",
+				  IRL_DEFAULT_SYNC_ENABLED);
+}
+
+void irl_sync_source_properties(obs_properties_t *props)
+{
+
+	obs_properties_add_bool(props, "sync_enabled",
+				obs_module_text("Sync"));
+	obs_properties_add_text(
+		props, "sync_help",
+		obs_module_text(
+			"Sync keeps this feed aligned with every other synced "
+			"feed by presenting each frame at the wall-clock time it "
+			"was captured, plus a shared offset. The master switch, "
+			"the offset and the NTP server live in the IRL Sync dock "
+			"(View > Docks), because they are one setting that every "
+			"source and every OBS instance has to agree on.\n\n"
+			"Requires the sender to embed SEI timecodes: in Moblin "
+			"that is Settings > Streams > (stream) > Video > "
+			"Timecodes, with an NTP pool set, and it only reaches "
+			"the wire on H.265/HEVC over SRT, SRTLA or RIST. The "
+			"dock reports \"No timecode\" when nothing arrives."),
+		OBS_TEXT_INFO);
+}
+
+/* ── Statistics ───────────────────────────────────────────── */
+
+/* The sync half of a source's get_stats proc. Kept here rather than inline in
+ * irl-source.c so that adding a field touches this file and the websocket
+ * vendor's table, and nothing else — the proc declaration these fill in is
+ * IRL_SYNC_STATS_PROC_DECL, right beside them in irl-sync.h. */
+void irl_sync_stats(struct irl_source *ctx, calldata_t *cd)
+{
+	/* Sync status comes from the registry rather than straight out of
+	 * ctx: those fields are receiver-thread-owned, and the registry
+	 * snapshot is the published, lock-protected view of them. */
+	struct irl_sync_snapshot sync = {0};
+	char timecode[24] = "";
+	if (irl_sync_get_snapshot(ctx, &sync) && sync.have_timecode) {
+		snprintf(timecode, sizeof(timecode), "%02u:%02u:%02u:%02u",
+			 sync.tc.hours, sync.tc.minutes, sync.tc.seconds,
+			 (unsigned)sync.tc.n_frames);
+	}
+
+	calldata_set_bool(cd, "sync_enabled",
+			  os_atomic_load_bool(&ctx->config.sync_enabled));
+	calldata_set_string(cd, "sync_status",
+			    irl_sync_status_name(sync.status));
+	calldata_set_string(cd, "sync_timecode", timecode);
+	calldata_set_int(cd, "sync_latency_ms", (long long)sync.latency_ms);
+	calldata_set_int(cd, "sync_latency_peak_ms",
+			 (long long)sync.latency_peak_ms);
+	calldata_set_int(cd, "sync_added_ms", (long long)sync.added_ms);
+	calldata_set_int(cd, "sync_error_ms", (long long)sync.error_ms);
+	calldata_set_int(cd, "sync_required_offset_ms",
+			 (long long)sync.required_offset_ms);
+}
+
+/* ── obs-websocket vendor ─────────────────────────────────── */
+
+/* The whole sync picture in one call: what the group is configured to do,
+ * whether this machine has a clock worth trusting, and every source's status.
+ *
+ * This is the alerting path. A dock only helps when someone is looking at it,
+ * and during a live IRL show the operator may be nowhere near the machine —
+ * whereas the person who can actually fix an out-of-sync feed is the one
+ * holding the phone, and chat is how you reach them. A bot polling this can
+ * say "chase cam out of sync, needs 7.4s" where it will be seen. */
+void irl_sync_vendor_status(obs_data_t *request_data,
+			    obs_data_t *response_data, void *priv_data)
+{
+	UNUSED_PARAMETER(request_data);
+	UNUSED_PARAMETER(priv_data);
+
+	struct irl_sync_config cfg;
+	irl_sync_config_get(&cfg);
+
+	obs_data_set_bool(response_data, "sync_enabled", cfg.enabled);
+	obs_data_set_int(response_data, "offset_ms", cfg.offset_ms);
+
+	struct irl_ntp_status ntp;
+	irl_ntp_get_status(&ntp);
+
+	obs_data_t *clock = obs_data_create();
+	obs_data_set_bool(clock, "synced", ntp.synced);
+	obs_data_set_string(clock, "server", ntp.server);
+	obs_data_set_int(clock, "offset_ms", ntp.offset_ns / 1000000LL);
+	obs_data_set_int(clock, "rtt_ms", ntp.rtt_ns / 1000000LL);
+	obs_data_set_int(clock, "age_ms", (long long)(ntp.age_ns / 1000000ULL));
+
+	int64_t utc_ns = 0;
+	if (irl_ntp_utc_now_ns(&utc_ns))
+		obs_data_set_int(clock, "utc_ms", utc_ns / 1000000LL);
+	obs_data_set_obj(response_data, "clock", clock);
+	obs_data_release(clock);
+
+	struct irl_sync_entry entries[IRL_SYNC_MAX_SOURCES];
+	size_t count = irl_sync_collect(entries, sizeof(entries) / sizeof(entries[0]));
+
+	obs_data_array_t *array = obs_data_array_create();
+	int64_t worst_required_ms = 0;
+	int out_of_sync = 0;
+
+	for (size_t i = 0; i < count; i++) {
+		const struct irl_sync_entry *e = &entries[i];
+		obs_data_t *item = obs_data_create();
+
+		obs_data_set_string(item, "source_name", e->source_name);
+		obs_data_set_bool(item, "sync_enabled", e->sync_enabled);
+		obs_data_set_string(item, "status",
+				    irl_sync_status_name(e->snap.status));
+		/* Which of the three causes of "no timecode" this is, so a bot
+		 * can say something actionable instead of just "not synced". */
+		obs_data_set_string(item, "timecode_reason",
+				    irl_sync_tc_reason_name(
+					    e->snap.tc_reason));
+		obs_data_set_int(item, "latency_ms", e->snap.latency_ms);
+		obs_data_set_int(item, "latency_peak_ms",
+				 e->snap.latency_peak_ms);
+		obs_data_set_int(item, "added_ms", e->snap.added_ms);
+		obs_data_set_int(item, "error_ms", e->snap.error_ms);
+		obs_data_set_int(item, "required_offset_ms",
+				 e->snap.required_offset_ms);
+
+		if (e->snap.have_timecode) {
+			char tc[24];
+			snprintf(tc, sizeof(tc), "%02u:%02u:%02u:%02u",
+				 e->snap.tc.hours, e->snap.tc.minutes,
+				 e->snap.tc.seconds,
+				 (unsigned)e->snap.tc.n_frames);
+			obs_data_set_string(item, "timecode", tc);
+		} else {
+			obs_data_set_string(item, "timecode", "");
+		}
+
+		if (e->sync_enabled &&
+		    e->snap.required_offset_ms > worst_required_ms)
+			worst_required_ms = e->snap.required_offset_ms;
+		if (e->snap.status == IRL_SYNC_TOO_SLOW ||
+		    e->snap.status == IRL_SYNC_STALE)
+			out_of_sync++;
+
+		obs_data_array_push_back(array, item);
+		obs_data_release(item);
+	}
+
+	obs_data_set_array(response_data, "sources", array);
+	obs_data_array_release(array);
+
+	/* Pre-computed so a bot does not have to reimplement the policy: the
+	 * count worth alerting on, and the offset that would clear it. */
+	obs_data_set_int(response_data, "out_of_sync_count", out_of_sync);
+	obs_data_set_int(response_data, "recommended_offset_ms",
+			 worst_required_ms);
+	obs_data_set_bool(response_data, "success", true);
 }

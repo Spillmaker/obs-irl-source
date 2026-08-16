@@ -296,12 +296,12 @@ set(PLUGIN_SOURCES
     src/receiver-audio.c
     src/receiver-decode.c
     src/receiver-stream.c
-    src/receiver-sync.c
+    src/sync/sync-control.c
     src/receiver-video.c
     src/audio-buffer.c
-    src/ntp-client.c
-    src/sei-timecode.c
-    src/sync-group.c
+    src/sync/sync-ntp.c
+    src/sync/sync-sei.c
+    src/sync/sync-config.c
     src/video-handler.c
     src/pts-repair.c
     src/settings.c
@@ -323,7 +323,7 @@ if(IRL_ENABLE_DOCK)
     find_package(Qt6 QUIET COMPONENTS Widgets)
     if(Qt6_FOUND)
         set(_IRL_DOCK ON)
-        list(APPEND PLUGIN_SOURCES src/sync-dock.cpp)
+        list(APPEND PLUGIN_SOURCES src/sync/sync-dock.cpp)
     else()
         message(STATUS
             "Qt6 Widgets not found; building without the IRL Sync dock. "

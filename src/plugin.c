@@ -9,9 +9,8 @@
  */
 
 #include <obs-module.h>
-#include "../include/irl-ntp.h"
 #include "../include/irl-source.h"
-#include "../include/irl-sync.h"
+#include "../include/sync/irl-sync.h"
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("obs-irl-source", "en-US")
@@ -42,10 +41,8 @@ bool obs_module_load(void)
 {
 	obs_register_source(&irl_source_info);
 
-	/* Ordering: the NTP client has to exist before the sync settings are
-	 * loaded, because loading them applies the configured server to it. */
-	irl_ntp_start();
-	irl_sync_init();
+	/* ── timecode sync ── */
+	irl_sync_module_load();
 	return true;
 }
 
@@ -56,9 +53,8 @@ bool obs_module_load(void)
 void obs_module_post_load(void)
 {
 	irl_websocket_vendor_register();
-#ifdef IRL_ENABLE_DOCK
-	irl_sync_dock_register();
-#endif
+	/* ── timecode sync ── */
+	irl_sync_module_post_load();
 }
 
 const char *obs_module_description(void)
@@ -74,9 +70,6 @@ const char *obs_module_author(void)
 
 void obs_module_unload(void)
 {
-#ifdef IRL_ENABLE_DOCK
-	irl_sync_dock_unregister();
-#endif
-	irl_ntp_stop();
-	irl_sync_shutdown();
+	/* ── timecode sync ── */
+	irl_sync_module_unload();
 }

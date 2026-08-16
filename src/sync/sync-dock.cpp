@@ -8,7 +8,7 @@
  * sync-dock.cpp — the IRL Sync dock.
  *
  * The only C++ in the plugin, and the only part that needs Qt. It reads the
- * registry in sync-group.c and writes the three global settings; it never
+ * registry in sync-config.c and writes the three global settings; it never
  * touches a source's internals, so nothing here can race the media path.
  *
  * obs-frontend-api is resolved at runtime rather than linked. The CI builds
@@ -55,8 +55,8 @@
 
 #include <obs-module.h>
 
-#include "../include/irl-ntp.h"
-#include "../include/irl-sync.h"
+#include "../../include/sync/irl-ntp.h"
+#include "../../include/sync/irl-sync.h"
 
 #ifdef _WIN32
 #include <windows.h>
