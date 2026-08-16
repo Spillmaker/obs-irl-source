@@ -469,6 +469,15 @@ void irl_handle_stream_read_error(struct irl_source *ctx, int read_ret)
 
 	irl_close_ffmpeg(ctx);
 	pts_repair_reset(&ctx->pts_state);
+	/* Here rather than only in irl_prepare_new_connection, which does not
+	 * run until the reconnect delay has elapsed. irl_sync_observe is driven
+	 * by arriving packets, so once they stop nothing updates or republishes
+	 * the status and the dock keeps showing whatever the source was doing
+	 * when the feed died — a blinking "No data" alarm on a source that is
+	 * simply not connected. Resetting here publishes Off straight away, and
+	 * leaves "No data" to mean what it says: a stream that is up and has
+	 * stopped stamping timecodes. */
+	irl_sync_reset(ctx);
 
 	/* Blank the source instead of leaving the last decoded frame frozen
 	 * on screen, matching what OBS's own media source does on media end

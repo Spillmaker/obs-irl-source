@@ -230,9 +230,15 @@ static bool timecode_latency_ns(const struct irl_timecode *tc,
  * The audio playout offset is the authoritative mapping — it is what
  * irl_video_due_time() puts every frame through — and it already accounts for
  * whatever the delay line is currently holding, because delaying the input
- * shifts the mapping with it. Before audio has primed there is nothing to map
- * against, so a video-only stream (or the first moments of any stream) falls
- * back to the video anchor. */
+ * shifts the mapping with it.
+ *
+ * The video anchor is a fallback for streams that have no audio at all, never
+ * for the moments before audio primes. It describes video that has not been
+ * through the delay line yet, so on a stream that does have audio it reports a
+ * presentation time several seconds out — one such reading went straight into
+ * the loop as a -5747ms correction, and the hold ceiling was the only thing
+ * that stopped it. A source with an audio track measures nothing until that
+ * audio is playing. */
 static bool predict_presentation_ns(struct irl_source *ctx, int64_t pts_ns,
 				    int64_t *presentation_ns)
 {
@@ -246,6 +252,9 @@ static bool predict_presentation_ns(struct irl_source *ctx, int64_t pts_ns,
 					     audio_pts_end);
 		return true;
 	}
+
+	if (ctx->audio_stream_idx >= 0)
+		return false;
 
 	if (ctx->video_ts_init) {
 		*presentation_ns = (int64_t)ctx->video_sys_base +
@@ -711,6 +720,17 @@ static void update_status(struct irl_source *ctx, uint64_t now_ns,
 		return;
 	}
 
+	/* Nothing measured yet is not the same as measured zero. Between engage
+	 * and the delay line's first release there is no reading at all, and
+	 * sync_error_ns is still the 0 it was reset to — which would otherwise
+	 * be inside the lock tolerance and report Locked for the several
+	 * seconds the line is filling. */
+	if (ctx->sync_error_count == 0) {
+		ctx->sync_locked = false;
+		ctx->sync_status = IRL_SYNC_ACQUIRING;
+		return;
+	}
+
 	int64_t err = llabs(ctx->sync_error_ns);
 	if (ctx->sync_locked) {
 		if (err > SYNC_UNLOCK_TOLERANCE_NS)
@@ -802,6 +822,17 @@ static void observe_timecode(struct irl_source *ctx, const AVPacket *pkt,
 		if (ctx->sync_hold_ns < 0)
 			ctx->sync_hold_ns = 0;
 		ctx->sync_seed_reported = false;
+
+		/* Hold off measuring until the line has filled and the first
+		 * packets have come out the far end. Engage takes the delay
+		 * line from empty to a hold's worth of content, so nothing
+		 * reaches the decoder — let alone the audio output — for that
+		 * long, and every reading before then describes a pipeline
+		 * that is not running yet. Without this the loop corrected in
+		 * the same call that engaged. */
+		ctx->sync_settle_until_ns = now_ns +
+					    (uint64_t)ctx->sync_hold_ns +
+					    SYNC_SETTLE_MARGIN_NS;
 		ctx->sync_engaged = true;
 		ctx->sync_locked = false;
 		ctx->sync_applied_offset_ms = irl_sync_offset_ms();

@@ -76,7 +76,12 @@ struct irl_source;
 /* ── Per-source status ────────────────────────────────────── */
 
 enum irl_sync_status {
-	/* Global sync off, or this source is not opted in. */
+	/* Nothing to align: sync switched off globally, this source not opted
+	 * in, or — the common one, since the dock only lists sources that are
+	 * opted in — no stream arriving. Deliberately not an alarm state. A
+	 * feed that is not connected is the normal condition before someone
+	 * goes live, and blinking at the operator for it is how a warning gets
+	 * trained away. */
 	IRL_SYNC_OFF,
 	/* Opted in, but nothing to align against: no SEI timecode in the
 	 * stream (H.264, RTMP, or timecodes not enabled on the sender), or

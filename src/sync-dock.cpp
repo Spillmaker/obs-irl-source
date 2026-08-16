@@ -993,8 +993,6 @@ private:
 		if (table->rowCount() != count)
 			table->setRowCount(count);
 
-		int alarms = 0;
-
 		for (int row = 0; row < count; row++) {
 			const struct irl_sync_entry &e = entries[row];
 			const struct irl_sync_snapshot &s = e.snap;
@@ -1032,7 +1030,6 @@ private:
 			const bool alarm = s.status == IRL_SYNC_TOO_SLOW ||
 					   s.status == IRL_SYNC_STALE;
 			if (alarm) {
-				alarms++;
 				status->setBackground(
 					blinkOn ? QBrush(QColor(248, 81, 73,
 								70))
@@ -1043,18 +1040,7 @@ private:
 
 		}
 
-		/* Carries the state when the dock is collapsed or narrow. */
-		if (alarms > 0) {
-			summaryLabel->setText(
-				QString("%1 source%2 out of sync")
-					.arg(alarms)
-					.arg(alarms == 1
-						     ? QString()
-						     : QStringLiteral("s")));
-			summaryLabel->setStyleSheet(QStringLiteral(
-				"color: #f85149; font-weight: bold;"));
-			summaryLabel->show();
-		} else if (count == 0) {
+		if (count == 0) {
 			/* An empty table otherwise reads as "the dock is
 			 * broken" rather than "nothing has opted in". */
 			summaryLabel->setText(QStringLiteral(
