@@ -74,16 +74,30 @@ static constexpr int BLINK_EVERY = 12; /* toggles every ~600ms */
  * self-contained readout that paints its own dark ground, so it looks the same
  * under every OBS theme — the way a hardware timecode display does. */
 static constexpr const char *PANEL_BG = "#0d1117";
+/* The two clock faces sit on their own ground, a shade above the panel, so each
+ * reads as one instrument rather than as four stacked lines of text. */
+static constexpr const char *PANEL_CARD = "#161b22";
 static constexpr const char *PANEL_BORDER = "#30363d";
 static constexpr const char *PANEL_DIM = "#7d8590";
 static constexpr const char *PANEL_LIVE = "#3fb950";
 static constexpr const char *PANEL_LIVE_DIM = "#2ea043";
 static constexpr const char *PANEL_DEAD = "#484f58";
+static constexpr const char *PANEL_FAULT = "#f85149";
+/* The offset badge. Amber rather than green: it is the one number here the
+ * operator sets, so it should not blend into the readouts that only report. */
+static constexpr const char *PANEL_WARN = "#e3b341";
+static constexpr const char *PANEL_WARN_BG = "#3a2c0b";
 
-/* Points above the UI font, for both rows of digits. Smaller than the single
- * big clock it replaced, since there are two of them now and the dock shares
- * its column with the source table. */
+/* Points above the UI font. The digits carry the panel, so the gap over
+ * everything around them is deliberately large — a caption at the UI size next
+ * to digits at nearly three times it is what makes the clock read as an
+ * instrument face and not as another label.
+ *
+ * The milliseconds get their own smaller size. They change too fast to read and
+ * exist to prove the clock is live, so they sit behind the seconds instead of
+ * competing with them for the same glance. */
 static constexpr int DIGIT_POINTS = 15;
+static constexpr int DIGIT_MS_POINTS = 6;
 
 /* ── Frontend entry points ────────────────────────────────── */
 
@@ -118,6 +132,42 @@ static QFont fixedFont(const QWidget *w, int pointDelta = 0, bool bold = false)
 	f.setPointSize(w->font().pointSize() + pointDelta);
 	f.setBold(bold);
 	return f;
+}
+
+/* The face the two clock rows are set in. The tracking is what stops the digits
+ * reading as a single run of glyphs at this size; the weight is left alone,
+ * because the size is already the emphasis and a bold fixed face this large
+ * turns into a slab. */
+static QFont digitFont(const QWidget *w)
+{
+	QFont f = fixedFont(w, DIGIT_POINTS);
+	f.setLetterSpacing(QFont::AbsoluteSpacing, 1.0);
+	return f;
+}
+
+/* One clock face: seconds large and bright, milliseconds smaller and dimmer
+ * behind them. Both halves are one label so they share a baseline — laying them
+ * out as two widgets aligns their boxes instead, which leaves the small text
+ * floating against the middle of the digits. */
+static QString digit_row(const QString &time, const char *colour,
+			 const char *ms_colour, int ms_points)
+{
+	const int dot = time.lastIndexOf(QChar('.'));
+	const QString seconds = dot < 0 ? time : time.left(dot);
+	const QString millis = dot < 0 ? QString() : time.mid(dot);
+
+	return QString("<span style='color:%1;'>%2</span>"
+		       "<span style='color:%3; font-size:%4pt;'>%5</span>")
+		.arg(colour, seconds, ms_colour)
+		.arg(ms_points)
+		.arg(millis);
+}
+
+/* A caption's leading dot, coloured by what it is reporting on. Carries the
+ * state at a glance for anyone not reading the words after it. */
+static QString status_dot(const char *colour)
+{
+	return QString("<span style='color:%1;'>&#9679;</span> ").arg(colour);
 }
 
 /* Character counts every measured cell is padded out to, and every measured
@@ -358,9 +408,11 @@ public:
 private:
 	QLabel *serverCaption = nullptr;
 	QLabel *clockLabel = nullptr;
-	QLabel *showingCaption = nullptr;
-	QLabel *showingLabel = nullptr;
 	QLabel *ntpLabel = nullptr;
+	QLabel *offsetCaption = nullptr;
+	QLabel *offsetBadge = nullptr;
+	QLabel *showingLabel = nullptr;
+	QLabel *showingCaption = nullptr;
 	QLabel *summaryLabel = nullptr;
 	QSpinBox *offsetSpin = nullptr;
 	QPushButton *applyButton = nullptr;
@@ -392,64 +444,103 @@ private:
 		root->addWidget(table, 1);
 	}
 
+	/* One clock face. Caption on top, digits, a status line under them —
+	 * the same three rows on both sides, so the pair reads as two of the
+	 * same instrument showing two different times rather than as a heading
+	 * with a footnote. */
+	QFrame *buildClockCard(QWidget *parent, QLabel **caption, QLabel **digits,
+			       QLabel **status)
+	{
+		auto *card = new QFrame(parent);
+		card->setObjectName(QStringLiteral("irlClockCard"));
+
+		auto *box = new QVBoxLayout(card);
+		box->setContentsMargins(14, 9, 14, 9);
+		box->setSpacing(2);
+
+		*caption = new QLabel(card);
+		(*caption)->setFont(fixedFont(this, -1, true));
+		(*caption)->setTextFormat(Qt::RichText);
+
+		*digits = new QLabel(card);
+		(*digits)->setFont(digitFont(this));
+		(*digits)->setTextFormat(Qt::RichText);
+		/* Reserve the height the digits will need so the panel does not
+		 * resize the moment the clock goes from placeholder to live. */
+		(*digits)->setMinimumHeight(
+			QFontMetrics((*digits)->font()).height() + 4);
+
+		*status = new QLabel(card);
+		(*status)->setFont(fixedFont(this, -1));
+		(*status)->setTextFormat(Qt::RichText);
+		(*status)->setStyleSheet(QString("color: %1;").arg(PANEL_DIM));
+
+		box->addWidget(*caption);
+		box->addWidget(*digits);
+		box->addWidget(*status);
+
+		return card;
+	}
+
 	QWidget *buildClockPanel()
 	{
 		auto *panel = new QFrame(this);
 		panel->setObjectName(QStringLiteral("irlClockPanel"));
 		panel->setStyleSheet(
 			QString("#irlClockPanel { background-color: %1;"
-				" border: 1px solid %2; border-radius: 8px; }")
-				.arg(PANEL_BG, PANEL_BORDER));
+				" border: 1px solid %2; border-radius: 8px; }"
+				" QFrame#irlClockCard { background-color: %3;"
+				" border: 1px solid %2; border-radius: 6px; }"
+				/* A theme that paints QWidget backgrounds
+				 * would otherwise draw a box behind every line
+				 * inside the cards. The badge sets its own
+				 * stylesheet, which outranks this. */
+				" QFrame#irlClockCard QLabel {"
+				" background: transparent; border: none; }")
+				.arg(PANEL_BG, PANEL_BORDER, PANEL_CARD));
 
-		auto *box = new QVBoxLayout(panel);
-		box->setContentsMargins(16, 10, 16, 12);
-		box->setSpacing(2);
+		auto *row = new QHBoxLayout(panel);
+		row->setContentsMargins(10, 10, 10, 10);
+		row->setSpacing(10);
 
-		/* The reference this clock is disciplined to, named rather than
-		 * labelled "NTP time": which server it is is the thing that has
+		/* Left: the reference. Named by its server rather than labelled
+		 * "NTP time", because which server it is is the thing that has
 		 * to match the senders, and the zone is spelled out because the
-		 * timecodes below arrive stamped in UTC too. */
-		serverCaption = new QLabel(panel);
-		serverCaption->setAlignment(Qt::AlignCenter);
-		QFont capFont = fixedFont(this, -2, true);
-		serverCaption->setFont(capFont);
-		serverCaption->setStyleSheet(
-			QString("color: %1;").arg(PANEL_DIM));
-		box->addWidget(serverCaption);
+		 * timecodes in the table arrive stamped in UTC too. */
+		row->addWidget(buildClockCard(panel, &serverCaption, &clockLabel,
+					      &ntpLabel),
+			       1);
 
-		clockLabel = new QLabel(QStringLiteral("--:--:--.---"), panel);
-		clockLabel->setAlignment(Qt::AlignCenter);
-		clockLabel->setFont(fixedFont(this, DIGIT_POINTS, true));
-		/* Reserve the height the digits will need so the panel does not
-		 * resize the moment the clock goes from placeholder to live. */
-		clockLabel->setMinimumHeight(
-			QFontMetrics(clockLabel->font()).height() + 4);
-		box->addWidget(clockLabel);
+		/* Right: what is on screen right now. Without it the reference
+		 * clock and the source timecodes differ by exactly the offset
+		 * and look like a bug. */
+		auto *right = buildClockCard(panel, &offsetCaption, &showingLabel,
+					     &showingCaption);
 
-		/* Carries the offset, because that is what the difference
-		 * between the two rows of digits is. */
-		showingCaption = new QLabel(panel);
-		showingCaption->setAlignment(Qt::AlignCenter);
-		showingCaption->setFont(capFont);
-		showingCaption->setStyleSheet(
-			QString("color: %1;").arg(PANEL_DIM));
-		box->addWidget(showingCaption);
+		/* The offset rides in the right caption, as a badge: it is the
+		 * difference between the two faces, so it belongs on the face
+		 * that is behind rather than on a line of its own. */
+		offsetBadge = new QLabel(right);
+		offsetBadge->setObjectName(QStringLiteral("irlOffsetBadge"));
+		offsetBadge->setFont(fixedFont(this, -1, true));
+		offsetBadge->setStyleSheet(
+			QString("#irlOffsetBadge { color: %1;"
+				" background-color: %2; border-radius: 4px;"
+				" padding: 1px 6px; }")
+				.arg(PANEL_WARN, PANEL_WARN_BG));
 
-		/* Without this row the big clock and the source timecodes
-		 * differ by exactly the offset and look like a bug. Same face
-		 * and size as the row above: the pair is meant to read as one
-		 * two-line display, not as a heading with a footnote. */
-		showingLabel = new QLabel(QStringLiteral("--:--:--.---"), panel);
-		showingLabel->setAlignment(Qt::AlignCenter);
-		showingLabel->setFont(fixedFont(this, DIGIT_POINTS, true));
-		showingLabel->setMinimumHeight(
-			QFontMetrics(showingLabel->font()).height() + 4);
-		box->addWidget(showingLabel);
+		auto *head = new QHBoxLayout();
+		head->setContentsMargins(0, 0, 0, 0);
+		head->setSpacing(6);
+		head->addWidget(offsetCaption);
+		head->addStretch(1);
+		head->addWidget(offsetBadge);
 
-		ntpLabel = new QLabel(panel);
-		ntpLabel->setAlignment(Qt::AlignCenter);
-		ntpLabel->setFont(fixedFont(this, -1));
-		box->addWidget(ntpLabel);
+		auto *rightBox = qobject_cast<QVBoxLayout *>(right->layout());
+		rightBox->removeWidget(offsetCaption);
+		rightBox->insertLayout(0, head);
+
+		row->addWidget(right, 1);
 
 		return panel;
 	}
@@ -692,50 +783,54 @@ private:
 		int64_t utc_ns = 0;
 		const bool live = irl_ntp_utc_now_ns(&utc_ns);
 
+		/* UTC, not local. The reference is UTC and the senders stamp
+		 * their timecodes in it, so rendering these two faces in local
+		 * time put the one clock in this dock that is not on the same
+		 * zone as the table under it. (toUTC() rather than a QTimeZone
+		 * overload: it reads the same on every Qt 6 the plugin might be
+		 * built against.) */
+		QString now = QStringLiteral("--:--:--.---");
+		QString showing = now;
 		if (live) {
 			const qint64 ms = utc_ns / 1000000LL;
-			/* UTC, not local. The reference is UTC and the senders
-			 * stamp their timecodes in it, so rendering these two
-			 * rows in local time put the one clock in this dock
-			 * that is not on the same zone as the table under it.
-			 * (toUTC() rather than a QTimeZone overload: it reads
-			 * the same on every Qt 6 the plugin might be built
-			 * against.) */
-			clockLabel->setText(
-				QDateTime::fromMSecsSinceEpoch(ms)
-					.toUTC()
-					.toString(QStringLiteral(
-						"HH:mm:ss.zzz")));
-			showingLabel->setText(
-				QDateTime::fromMSecsSinceEpoch(ms -
-							       cfg.offset_ms)
-					.toUTC()
-					.toString(QStringLiteral(
-						"HH:mm:ss.zzz")));
+			const QString fmt = QStringLiteral("HH:mm:ss.zzz");
+			now = QDateTime::fromMSecsSinceEpoch(ms).toUTC().toString(
+				fmt);
+			showing = QDateTime::fromMSecsSinceEpoch(ms -
+								 cfg.offset_ms)
+					  .toUTC()
+					  .toString(fmt);
+		}
+
+		const char *digit_colour = live ? PANEL_LIVE : PANEL_DEAD;
+		const char *ms_colour = live ? PANEL_LIVE_DIM : PANEL_DEAD;
+		const int ms_points = font().pointSize() + DIGIT_MS_POINTS;
+
+		clockLabel->setText(digit_row(now, digit_colour, ms_colour,
+					      ms_points));
+		showingLabel->setText(digit_row(showing, digit_colour, ms_colour,
+						ms_points));
+
+		offsetBadge->setText(
+			QString("−%1").arg(format_ms(cfg.offset_ms)));
+
+		if (live) {
 			showingCaption->setText(
-				QString("S H O W I N G   ·   O F F S E T   −%1")
-					.arg(format_ms(cfg.offset_ms)));
+				status_dot(PANEL_WARN) +
+				QStringLiteral("showing · delayed feed"));
 		} else {
-			clockLabel->setText(QStringLiteral("--:--:--.---"));
-			showingLabel->setText(QStringLiteral("--:--:--.---"));
 			/* Not being synced is only a problem if sync is meant
 			 * to be running. Polling is gated on the master switch,
 			 * so before it is on there is nothing wrong to report. */
 			showingCaption->setText(
 				cfg.enabled
-					? QStringLiteral(
-						  "NO CLOCK REFERENCE — SYNC CANNOT RUN")
-					: QStringLiteral(
-						  "TURN SYNC ON TO START THE CLOCK"));
+					? status_dot(PANEL_FAULT) +
+						  QStringLiteral(
+							  "no clock reference — sync cannot run")
+					: status_dot(PANEL_DEAD) +
+						  QStringLiteral(
+							  "turn sync on to start the clock"));
 		}
-		clockLabel->setStyleSheet(
-			QString("color: %1; letter-spacing: 2px;")
-				.arg(live ? PANEL_LIVE : PANEL_DEAD));
-		/* Dimmer than the row above so the reference clock still reads
-		 * as the primary one. */
-		showingLabel->setStyleSheet(
-			QString("color: %1; letter-spacing: 2px;")
-				.arg(live ? PANEL_LIVE_DIM : PANEL_DEAD));
 
 		/* An unreachable server keeps the last offset ticking along
 		 * plausibly, so freshness is reported, not just "synced". */
@@ -750,7 +845,7 @@ private:
 					 : QStringLiteral("idle — polls while sync is on");
 			fault = cfg.enabled;
 		} else {
-			health = QString("synced %1s ago  ±%2 ms")
+			health = QString("synced %1s ago · ±%2 ms")
 					 .arg(ntp.age_ns / 1000000000ULL)
 					 .arg(ntp.rtt_ns / 2000000LL);
 			/* A stale reference keeps ticking plausibly while
@@ -760,16 +855,25 @@ private:
 
 		serverCaption->setText(
 			ntp.server[0]
-				? QString("%1   ·   U T C")
-					  .arg(QString::fromUtf8(ntp.server))
-				: QStringLiteral("N O   S E R V E R"));
+				? QString("<span style='color:%1;'>🌐 %2</span>"
+					  "<span style='color:%3;'> · UTC</span>")
+					  .arg(PANEL_LIVE,
+					       QString::fromUtf8(ntp.server)
+						       .toUpper(),
+					       PANEL_LIVE_DIM)
+				: QString("<span style='color:%1;'>🌐 NO SERVER</span>")
+					  .arg(PANEL_DEAD));
+
+		offsetCaption->setText(
+			QString("<span style='color:%1;'>↺ OFFSET</span>")
+				.arg(PANEL_DIM));
 
 		/* The server itself is the caption above the digits now, so
 		 * this line carries only how healthy it is. */
-		ntpLabel->setText(health);
-		ntpLabel->setStyleSheet(
-			QString("color: %1;")
-				.arg(fault ? "#f85149" : PANEL_DIM));
+		ntpLabel->setText(status_dot(fault ? PANEL_FAULT
+						   : live ? PANEL_LIVE
+							  : PANEL_DEAD) +
+				  health);
 	}
 
 	void updateApplyButton()
