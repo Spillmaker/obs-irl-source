@@ -88,16 +88,21 @@ static constexpr const char *PANEL_FAULT = "#f85149";
 static constexpr const char *PANEL_WARN = "#e3b341";
 static constexpr const char *PANEL_WARN_BG = "#3a2c0b";
 
-/* Points above the UI font. The digits carry the panel, so the gap over
- * everything around them is deliberately large — a caption at the UI size next
- * to digits at nearly three times it is what makes the clock read as an
- * instrument face and not as another label.
+/* Panel type sizes, in pixels.
  *
- * The milliseconds get their own smaller size. They change too fast to read and
- * exist to prove the clock is live, so they sit behind the seconds instead of
- * competing with them for the same glance. */
-static constexpr int DIGIT_POINTS = 15;
-static constexpr int DIGIT_MS_POINTS = 6;
+ * Fixed rather than derived from the UI font, for the same reason the palette
+ * above is fixed: this is an instrument face, and an instrument's digits are
+ * the size they are. The gap between the digits and everything around them is
+ * what makes the panel read as one, so it is deliberately large.
+ *
+ * These go through each widget's own stylesheet, never QWidget::setFont, and
+ * every rule carries an ID selector. setFont loses outright — a font-size in
+ * the OBS theme's application stylesheet overrides it — and a bare declaration
+ * in a widget stylesheet loses to any themed rule more specific than a type
+ * selector. An ID rule on the widget itself outranks both. */
+static constexpr int DIGIT_PX = 30;
+static constexpr int CAPTION_PX = 12;
+static constexpr int STATUS_PX = 12;
 
 /* ── Frontend entry points ────────────────────────────────── */
 
@@ -134,33 +139,32 @@ static QFont fixedFont(const QWidget *w, int pointDelta = 0, bool bold = false)
 	return f;
 }
 
-/* The face the two clock rows are set in. The tracking is what stops the digits
- * reading as a single run of glyphs at this size; the weight is left alone,
- * because the size is already the emphasis and a bold fixed face this large
- * turns into a slab. */
-static QFont digitFont(const QWidget *w)
+/* The fixed-pitch family by name, so it can be named in a stylesheet. Asking
+ * for it by family is the whole point: QFont::setStyleHint(QFont::Monospace) is
+ * a hint the theme's proportional family satisfies, and proportional digits
+ * jump sideways as they tick. */
+static QString fixedFamily()
 {
-	QFont f = fixedFont(w, DIGIT_POINTS);
-	f.setLetterSpacing(QFont::AbsoluteSpacing, 1.0);
-	return f;
+	return QFontDatabase::systemFont(QFontDatabase::FixedFont).family();
 }
 
-/* One clock face: seconds large and bright, milliseconds smaller and dimmer
- * behind them. Both halves are one label so they share a baseline — laying them
- * out as two widgets aligns their boxes instead, which leaves the small text
- * floating against the middle of the digits. */
-static QString digit_row(const QString &time, const char *colour,
-			 const char *ms_colour, int ms_points)
+static QString panelFontCss(int px, bool bold)
 {
-	const int dot = time.lastIndexOf(QChar('.'));
-	const QString seconds = dot < 0 ? time : time.left(dot);
-	const QString millis = dot < 0 ? QString() : time.mid(dot);
+	return QString("font-family: \"%1\"; font-size: %2px;"
+		       " font-weight: %3;")
+		.arg(fixedFamily())
+		.arg(px)
+		.arg(bold ? "bold" : "normal");
+}
 
-	return QString("<span style='color:%1;'>%2</span>"
-		       "<span style='color:%3; font-size:%4pt;'>%5</span>")
-		.arg(colour, seconds, ms_colour)
-		.arg(ms_points)
-		.arg(millis);
+/* One clock face, whole. The milliseconds are the same size and weight as the
+ * seconds: a clock reads as a clock because its digits are one run, and setting
+ * part of it smaller turns the readout into a number with a footnote. */
+static QString digitStyle(const char *colour)
+{
+	return QString("#irlClockDigits { color: %1; background: transparent;"
+		       " border: none; %2 }")
+		.arg(colour, panelFontCss(DIGIT_PX, true));
 }
 
 /* A caption's leading dot, coloured by what it is reporting on. Carries the
@@ -459,21 +463,35 @@ private:
 		box->setSpacing(2);
 
 		*caption = new QLabel(card);
-		(*caption)->setFont(fixedFont(this, -1, true));
+		(*caption)->setObjectName(QStringLiteral("irlClockCaption"));
 		(*caption)->setTextFormat(Qt::RichText);
+		(*caption)->setStyleSheet(
+			QString("#irlClockCaption { background: transparent;"
+				" border: none; %1 }")
+				.arg(panelFontCss(CAPTION_PX, true)));
 
+		/* Plain text, so nothing about the digits is negotiable: rich
+		 * text would let a stray tag resize part of the face. */
 		*digits = new QLabel(card);
-		(*digits)->setFont(digitFont(this));
-		(*digits)->setTextFormat(Qt::RichText);
+		(*digits)->setObjectName(QStringLiteral("irlClockDigits"));
+		(*digits)->setTextFormat(Qt::PlainText);
+		(*digits)->setStyleSheet(digitStyle(PANEL_DEAD));
 		/* Reserve the height the digits will need so the panel does not
-		 * resize the moment the clock goes from placeholder to live. */
-		(*digits)->setMinimumHeight(
-			QFontMetrics((*digits)->font()).height() + 4);
+		 * resize the moment the clock goes from placeholder to live.
+		 * Measured from the same spec the stylesheet sets, because the
+		 * widget font is not what draws them any more. */
+		QFont probe(fixedFamily());
+		probe.setPixelSize(DIGIT_PX);
+		probe.setBold(true);
+		(*digits)->setMinimumHeight(QFontMetrics(probe).height() + 4);
 
 		*status = new QLabel(card);
-		(*status)->setFont(fixedFont(this, -1));
+		(*status)->setObjectName(QStringLiteral("irlClockStatus"));
 		(*status)->setTextFormat(Qt::RichText);
-		(*status)->setStyleSheet(QString("color: %1;").arg(PANEL_DIM));
+		(*status)->setStyleSheet(
+			QString("#irlClockStatus { color: %1;"
+				" background: transparent; border: none; %2 }")
+				.arg(PANEL_DIM, panelFontCss(STATUS_PX, false)));
 
 		box->addWidget(*caption);
 		box->addWidget(*digits);
@@ -522,12 +540,12 @@ private:
 		 * that is behind rather than on a line of its own. */
 		offsetBadge = new QLabel(right);
 		offsetBadge->setObjectName(QStringLiteral("irlOffsetBadge"));
-		offsetBadge->setFont(fixedFont(this, -1, true));
 		offsetBadge->setStyleSheet(
 			QString("#irlOffsetBadge { color: %1;"
 				" background-color: %2; border-radius: 4px;"
-				" padding: 1px 6px; }")
-				.arg(PANEL_WARN, PANEL_WARN_BG));
+				" padding: 1px 6px; %3 }")
+				.arg(PANEL_WARN, PANEL_WARN_BG,
+				     panelFontCss(CAPTION_PX, true)));
 
 		auto *head = new QHBoxLayout();
 		head->setContentsMargins(0, 0, 0, 0);
@@ -802,14 +820,13 @@ private:
 					  .toString(fmt);
 		}
 
-		const char *digit_colour = live ? PANEL_LIVE : PANEL_DEAD;
-		const char *ms_colour = live ? PANEL_LIVE_DIM : PANEL_DEAD;
-		const int ms_points = font().pointSize() + DIGIT_MS_POINTS;
+		const QString style =
+			digitStyle(live ? PANEL_LIVE : PANEL_DEAD);
 
-		clockLabel->setText(digit_row(now, digit_colour, ms_colour,
-					      ms_points));
-		showingLabel->setText(digit_row(showing, digit_colour, ms_colour,
-						ms_points));
+		clockLabel->setText(now);
+		clockLabel->setStyleSheet(style);
+		showingLabel->setText(showing);
+		showingLabel->setStyleSheet(style);
 
 		offsetBadge->setText(
 			QString("−%1").arg(format_ms(cfg.offset_ms)));
