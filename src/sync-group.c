@@ -135,12 +135,6 @@ void irl_sync_set_enabled(bool enabled)
 	 * change: their delay lines start from nothing. */
 	os_atomic_inc_long(&sync.offset_generation);
 
-	/* The clock reference is only wanted while sync is. Nothing else in
-	 * the plugin uses NTP, so leaving it polling would mean sending
-	 * packets to a third-party pool on behalf of users who never turned
-	 * this on. */
-	irl_ntp_set_enabled(enabled);
-
 	blog(LOG_INFO, "[irl-source] Timecode sync %s (offset %dms)",
 	     enabled ? "enabled" : "disabled", irl_sync_offset_ms());
 	sync_config_save();
@@ -393,11 +387,18 @@ void irl_sync_init(void)
 	sync_config_load();
 
 	/* Apply the loaded settings to the clock. Order matters only in that
-	 * the server has to be known before polling is allowed to start. */
+	 * the server has to be known before polling is allowed to start.
+	 *
+	 * Polling is not gated on the master switch. It was, to avoid sending
+	 * packets to a third-party pool for users who never turn sync on, and
+	 * the cost of that was a dock whose clock sat dead until sync had been
+	 * enabled once — which is backwards, because the clock is what tells
+	 * you whether sync would work before you commit to it. One request a
+	 * minute is the price. */
 	struct irl_sync_config cfg;
 	irl_sync_config_get(&cfg);
 	irl_ntp_set_server(cfg.ntp_server);
-	irl_ntp_set_enabled(cfg.enabled);
+	irl_ntp_set_enabled(true);
 }
 
 void irl_sync_shutdown(void)

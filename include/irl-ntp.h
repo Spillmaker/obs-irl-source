@@ -17,11 +17,12 @@
  *
  * One client per module, shared by every source. Thread-safe.
  *
- * Polling is gated on irl_ntp_set_enabled(), which sync-group.c ties to the
- * master sync switch. A plugin that quietly sent packets to a third-party pool
- * every minute on behalf of users who never turned sync on would be making a
- * network request nobody asked for; the cost of gating is a few seconds before
- * the first sync lands after enabling.
+ * Polling runs from module load, not from the master sync switch. It used to
+ * be gated on the switch, so as not to send packets to a third-party pool for
+ * users who never turn sync on, and the cost was a dock whose clock stayed
+ * dead until sync had been enabled once. That is the wrong way round: the
+ * clock is what an operator reads to decide whether sync is worth turning on.
+ * irl_ntp_set_enabled() remains for that gate to be reinstated.
  */
 
 #pragma once

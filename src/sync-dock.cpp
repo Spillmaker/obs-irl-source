@@ -22,6 +22,7 @@
 
 #include <QAbstractButton>
 #include <QAbstractSpinBox>
+#include <QApplication>
 #include <QBrush>
 #include <QColor>
 #include <QDateTime>
@@ -37,10 +38,14 @@
 #include <QIcon>
 #include <QLabel>
 #include <QLineEdit>
+#include <QPalette>
+#include <QPainter>
+#include <QPen>
 #include <QPushButton>
 #include <QSize>
 #include <QSpinBox>
 #include <QStyle>
+#include <QStyledItemDelegate>
 #include <QTableWidget>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -184,6 +189,12 @@ static QString digitStyle(const char *colour)
  * itself was not moving. */
 static constexpr int VALUE_CHARS = 10;
 static constexpr int TC_CHARS = 12;
+/* Drift is the one figure that does not need the full width: it is a value in
+ * milliseconds in every case anyone watches it for, so it is padded and sized
+ * for "-999 ms" with one character to spare rather than for the ±30 minute
+ * worst case the others carry. A drift wide enough to overrun this is a source
+ * whose status column is already saying something more useful. */
+static constexpr int DRIFT_CHARS = 8;
 
 /* Slack added to a measured column so the text is not flush against the cell
  * edge, and so a theme with roomier cell margins still clears the value. */
@@ -251,23 +262,6 @@ static QColor status_colour(enum irl_sync_status status)
 	}
 }
 
-/* "No timecode" alone sends people looking in the wrong place, so each cause
- * carries its own fix. See irl_sync_tc_reason. */
-static QString no_timecode_text(enum irl_sync_tc_reason reason)
-{
-	switch (reason) {
-	case IRL_SYNC_TC_NO_CLOCK:
-		return QStringLiteral("No timecode · no NTP reference here");
-	case IRL_SYNC_TC_CODEC:
-		return QStringLiteral("No timecode · stream is not H.265");
-	case IRL_SYNC_TC_ABSENT:
-		return QStringLiteral("No timecode · sender is not stamping");
-	case IRL_SYNC_TC_OK:
-	default:
-		return QStringLiteral("No timecode");
-	}
-}
-
 static QString status_text(const struct irl_sync_snapshot &snap)
 {
 	switch (snap.status) {
@@ -276,21 +270,24 @@ static QString status_text(const struct irl_sync_snapshot &snap)
 	case IRL_SYNC_ACQUIRING:
 		return QStringLiteral("Acquiring…");
 	case IRL_SYNC_TOO_SLOW:
-		/* The number is the point: it tells the operator whether to
-		 * raise the offset themselves or call the person in the field. */
-		return QString("▲ Too slow · needs ≥ %1 s")
-			.arg(snap.required_offset_ms / 1000);
+		return QStringLiteral("Too slow");
 	case IRL_SYNC_STALE:
-		return QStringLiteral("▲ No data");
+		return QStringLiteral("No data");
 	case IRL_SYNC_NO_TIMECODE:
-		return no_timecode_text(snap.tc_reason);
+		/* Which of the three causes it is lives in the tooltip. The
+		 * cause is the actionable half, but spelling it out here sized
+		 * the column for the longest of them on every row, and the
+		 * underline says there is more to read. */
+		return QStringLiteral("No timecode");
 	case IRL_SYNC_OFF:
 	default:
 		return QStringLiteral("Off");
 	}
 }
 
-/* Spelled out in full where there is room for it. */
+/* Spelled out in full, on hover. Every state that returns something here is
+ * drawn with a dotted underline — see UnderlineTipDelegate — so returning a
+ * tooltip is also what advertises one. */
 static QString status_tooltip(const struct irl_sync_snapshot &snap)
 {
 	switch (snap.status) {
@@ -317,10 +314,13 @@ static QString status_tooltip(const struct irl_sync_snapshot &snap)
 		}
 		return QString();
 	case IRL_SYNC_TOO_SLOW:
-		return QStringLiteral(
-			"This feed arrives later than the target offset, so its frames "
-			"are already past their slot. Raise the offset, or improve that "
-			"uplink.");
+		/* The number is the point: it tells the operator whether to
+		 * raise the offset themselves or call the person in the
+		 * field. */
+		return QString("This feed arrives later than the target offset, so "
+			       "its frames are already past their slot. Raise the "
+			       "offset to at least %1 s, or improve that uplink.")
+			.arg(snap.required_offset_ms / 1000);
 	case IRL_SYNC_STALE:
 		return QStringLiteral("This feed has stopped delivering.");
 	default:
@@ -383,6 +383,65 @@ static void applyGearIcon(QPushButton *button)
 /* ── Dock widget ──────────────────────────────────────────── */
 
 namespace {
+
+/* Marks a cell whose text is the short form of something longer by underlining
+ * it with dots, the way a printed glossary term is marked.
+ *
+ * A tooltip nobody knows is there is a tooltip nobody reads, and the status
+ * column now says "No timecode" where it used to say which of the three causes
+ * it was — so the cell has to advertise that the rest of it is one hover away.
+ * Keyed off the tooltip itself rather than a separate flag, so a state can
+ * never gain a tooltip without gaining the underline that points at it. */
+class UnderlineTipDelegate : public QStyledItemDelegate {
+public:
+	using QStyledItemDelegate::QStyledItemDelegate;
+
+	void paint(QPainter *painter, const QStyleOptionViewItem &option,
+		   const QModelIndex &index) const override
+	{
+		QStyledItemDelegate::paint(painter, option, index);
+
+		if (index.data(Qt::ToolTipRole).toString().isEmpty())
+			return;
+
+		const QString text = index.data(Qt::DisplayRole).toString();
+		if (text.isEmpty())
+			return;
+
+		QStyleOptionViewItem opt = option;
+		initStyleOption(&opt, index);
+
+		const QStyle *style = opt.widget ? opt.widget->style()
+						 : QApplication::style();
+		const QRect box = style->subElementRect(
+			QStyle::SE_ItemViewItemText, &opt, opt.widget);
+
+		/* Under the text, not under the cell: the line has to be as
+		 * wide as the words to read as an underline rather than as a
+		 * border. */
+		const QFontMetrics fm(opt.font);
+		const int width = qMin(fm.horizontalAdvance(text), box.width());
+		int x = box.left();
+		if (opt.displayAlignment & Qt::AlignHCenter)
+			x += (box.width() - width) / 2;
+		else if (opt.displayAlignment & Qt::AlignRight)
+			x = box.right() - width;
+
+		const int baseline = box.top() + (box.height() + fm.ascent() -
+						  fm.descent()) / 2;
+
+		QPen pen(opt.palette.color(QPalette::Text));
+		const QVariant fg = index.data(Qt::ForegroundRole);
+		if (fg.isValid())
+			pen.setColor(fg.value<QBrush>().color());
+		pen.setStyle(Qt::DotLine);
+
+		painter->save();
+		painter->setPen(pen);
+		painter->drawLine(x, baseline + 2, x + width, baseline + 2);
+		painter->restore();
+	}
+};
 
 /* Only sources with Sync ticked are listed, so there is no column saying
  * whether they are: every row is one. */
@@ -652,8 +711,7 @@ private:
 		 * appearing in Error moved the whole right-hand side of the
 		 * table. A readout that jitters as it updates is harder to read
 		 * than one that is a few pixels wider than it needs to be. */
-		auto fix = [&](int column, int chars,
-			       int padding = CELL_PADDING_PX) {
+		auto fix = [&](int column, int chars) {
 			const QFontMetrics values(fixedFont(this));
 			const QFontMetrics header(
 				table->horizontalHeader()->font());
@@ -667,7 +725,7 @@ private:
 				     title ? header.horizontalAdvance(
 						     title->text())
 					   : 0) +
-				padding;
+				CELL_PADDING_PX;
 			table->horizontalHeader()->setSectionResizeMode(
 				column, QHeaderView::Fixed);
 			table->setColumnWidth(column, width);
@@ -676,16 +734,16 @@ private:
 		fix(COL_TIMECODE, TC_CHARS);
 		fix(COL_LATENCY, VALUE_CHARS);
 		fix(COL_ADDED, VALUE_CHARS);
-		/* Drift is the narrowest thing here — a value in milliseconds
-		 * almost always — so it gets half the slack the others do
-		 * rather than sitting in a column sized for its title. */
-		fix(COL_DRIFT, VALUE_CHARS, CELL_PADDING_PX / 2);
+		fix(COL_DRIFT, DRIFT_CHARS);
 
 		/* Status is prose rather than a figure, so it is sized from the
 		 * longest wording instead of a character count, and left
 		 * resizable because it is the one column someone might want to
 		 * reclaim space from. Interactive never resizes itself, so it
 		 * does not reintroduce the jitter. */
+		table->setItemDelegateForColumn(COL_STATUS,
+						new UnderlineTipDelegate(table));
+
 		table->horizontalHeader()->setSectionResizeMode(
 			COL_STATUS, QHeaderView::Interactive);
 		table->setColumnWidth(COL_STATUS,
@@ -959,8 +1017,10 @@ private:
 				->setText(aligning ? format_value(s.added_ms)
 						   : no_value(VALUE_CHARS));
 			cell(row, COL_DRIFT)
-				->setText(aligning ? format_value(s.error_ms)
-						   : no_value(VALUE_CHARS));
+				->setText(aligning
+						  ? pad(format_ms(s.error_ms),
+							DRIFT_CHARS)
+						  : no_value(DRIFT_CHARS));
 
 			QTableWidgetItem *status = cell(row, COL_STATUS);
 			status->setText(status_text(s));
