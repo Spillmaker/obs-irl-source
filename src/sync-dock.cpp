@@ -41,14 +41,15 @@
 #include <QLineEdit>
 #include <QPalette>
 #include <QMouseEvent>
+#include <QPaintEvent>
 #include <QPainter>
 #include <QPen>
-#include <QPushButton>
 #include <QSpinBox>
 #include <QStyle>
 #include <QStyledItemDelegate>
 #include <QTableWidget>
 #include <QTimer>
+#include <QVariantAnimation>
 #include <QVBoxLayout>
 #include <QWidget>
 
@@ -364,6 +365,93 @@ static int widest_status_px(const QWidget *w)
 
 namespace {
 
+/* The master switch, drawn as a sliding toggle rather than a labelled button.
+ *
+ * It lives on the offset card's bottom line, where a line of prose used to sit.
+ * That is the point: every other control in this dock is now the readout it
+ * affects, and a rectangular "Sync: ON" button parked underneath the panel read
+ * as a separate piece of furniture. A toggle needs no text because its position
+ * is its state.
+ *
+ * QAbstractButton rather than QCheckBox: the checkable behaviour, the clicked
+ * signal and the keyboard handling all come for free, and only the painting has
+ * to be replaced. The knob slides rather than jumping, because the movement is
+ * what tells you which way it just went. */
+class ToggleSwitch : public QAbstractButton {
+public:
+	explicit ToggleSwitch(QWidget *parent = nullptr)
+		: QAbstractButton(parent)
+	{
+		setCheckable(true);
+		setCursor(Qt::PointingHandCursor);
+		setFocusPolicy(Qt::NoFocus);
+		setFixedSize(TRACK_W, TRACK_H);
+
+		slide.setDuration(120);
+		slide.setStartValue(0.0);
+		slide.setEndValue(1.0);
+		QObject::connect(&slide, &QVariantAnimation::valueChanged, this,
+				 [this](const QVariant &v) {
+					 position = v.toReal();
+					 update();
+				 });
+	}
+
+	/* Both entry points go through here so the knob is never left behind
+	 * the state: clicked() flips the check, and the periodic refresh sets
+	 * it from the config. */
+	void setOn(bool on)
+	{
+		if (isChecked() != on)
+			setChecked(on);
+
+		const qreal target = on ? 1.0 : 0.0;
+		if (qFuzzyCompare(position + 1.0, target + 1.0))
+			return;
+
+		slide.stop();
+		slide.setStartValue(position);
+		slide.setEndValue(target);
+		slide.start();
+	}
+
+protected:
+	void paintEvent(QPaintEvent *) override
+	{
+		QPainter p(this);
+		p.setRenderHint(QPainter::Antialiasing);
+
+		const qreal radius = height() / 2.0;
+		p.setPen(Qt::NoPen);
+
+		/* The track carries the state as colour, the knob as position.
+		 * Either one alone would do; both is what makes it readable at
+		 * a glance and still readable without colour. */
+		QColor off(QString::fromLatin1(PANEL_DEAD));
+		QColor on(QString::fromLatin1(PANEL_LIVE));
+		QColor track(off.red() + (on.red() - off.red()) * position,
+			     off.green() + (on.green() - off.green()) * position,
+			     off.blue() + (on.blue() - off.blue()) * position);
+		p.setBrush(track);
+		p.drawRoundedRect(QRectF(0, 0, width(), height()), radius,
+				  radius);
+
+		const qreal margin = 2.0;
+		const qreal size = height() - 2 * margin;
+		const qreal travel = width() - 2 * margin - size;
+		p.setBrush(QColor(QStringLiteral("#f0f6fc")));
+		p.drawEllipse(
+			QRectF(margin + travel * position, margin, size, size));
+	}
+
+private:
+	static constexpr int TRACK_W = 34;
+	static constexpr int TRACK_H = 18;
+
+	QVariantAnimation slide;
+	qreal position = 0.0;
+};
+
 /* A label that opens something when clicked.
  *
  * The two settings this dock has are the NTP server and the offset, and both
@@ -490,7 +578,7 @@ private:
 	QLabel *showingLabel = nullptr;
 	QLabel *showingCaption = nullptr;
 	QLabel *summaryLabel = nullptr;
-	QPushButton *masterButton = nullptr;
+	ToggleSwitch *masterSwitch = nullptr;
 	QTableWidget *table = nullptr;
 
 	int ticks = 0;
@@ -502,7 +590,6 @@ private:
 		root->setSpacing(10);
 
 		root->addWidget(buildClockPanel());
-		root->addLayout(buildControls());
 
 		summaryLabel = new QLabel(this);
 		summaryLabel->setAlignment(Qt::AlignCenter);
@@ -623,32 +710,30 @@ private:
 		rightBox->removeWidget(offsetCaption);
 		rightBox->insertLayout(0, head);
 
+		/* The master switch takes the bottom line of this card, where
+		 * the status prose was. It belongs on this face rather than the
+		 * reference clock: the reference ticks whether sync is on or
+		 * not, and this is the one that goes grey when it is off. */
+		masterSwitch = new ToggleSwitch(right);
+		QObject::connect(masterSwitch, &QAbstractButton::clicked, this,
+				 [this](bool checked) {
+					 irl_sync_set_enabled(checked);
+					 updateMasterSwitch(checked);
+				 });
+
+		auto *foot = new QHBoxLayout();
+		foot->setContentsMargins(0, 0, 0, 0);
+		foot->setSpacing(8);
+		foot->addWidget(masterSwitch);
+		foot->addWidget(showingCaption);
+		foot->addStretch(1);
+
+		rightBox->removeWidget(showingCaption);
+		rightBox->addLayout(foot);
+
 		row->addWidget(right, 1);
 
 		return panel;
-	}
-
-	QHBoxLayout *buildControls()
-	{
-		auto *row = new QHBoxLayout();
-		row->setSpacing(6);
-		row->addStretch(1);
-
-		/* The master switch is all that is left here. The server and
-		 * the offset are edited by clicking the panel readouts that
-		 * already show them, rather than by a second copy of the same
-		 * two values sitting under the clock. */
-		masterButton = new QPushButton(this);
-		masterButton->setCheckable(true);
-		masterButton->setMinimumWidth(90);
-		QObject::connect(masterButton, &QAbstractButton::clicked, this,
-				 [this](bool checked) {
-					 irl_sync_set_enabled(checked);
-					 updateMasterButton(checked);
-				 });
-		row->addWidget(masterButton);
-
-		return row;
 	}
 
 	void buildTable()
@@ -824,11 +909,14 @@ private:
 		irl_sync_set_offset_ms(spin->value() * 1000);
 	}
 
-	void updateMasterButton(bool enabled)
+	void updateMasterSwitch(bool enabled)
 	{
-		masterButton->setChecked(enabled);
-		masterButton->setText(enabled ? QStringLiteral("Sync: ON")
-					      : QStringLiteral("Sync: OFF"));
+		masterSwitch->setOn(enabled);
+		/* The switch carries no text, so the words it replaced live
+		 * here. */
+		masterSwitch->setToolTip(
+			enabled ? QStringLiteral("Timecode sync is on")
+				: QStringLiteral("Timecode sync is off"));
 	}
 
 	QTableWidgetItem *cell(int row, int column)
@@ -912,9 +1000,10 @@ private:
 			QString("−%1").arg(format_ms(cfg.offset_ms)));
 
 		if (live) {
-			showingCaption->setText(
-				QStringLiteral("showing · delayed feed"));
-			showingCaption->setStyleSheet(statusStyle(PANEL_DIM));
+			/* Nothing to say: the switch beside this line already
+			 * says sync is on, and the two faces above say what it
+			 * is doing. Prose here would only repeat them. */
+			showingCaption->setText(QString());
 		} else {
 			/* Not being synced is only a problem if sync is meant
 			 * to be running. Polling is gated on the master switch,
@@ -977,7 +1066,7 @@ private:
 	 * collection load, the websocket — shows up on its own. */
 	void refreshControls(const struct irl_sync_config &cfg)
 	{
-		updateMasterButton(cfg.enabled);
+		updateMasterSwitch(cfg.enabled);
 	}
 
 	void refreshTable()
