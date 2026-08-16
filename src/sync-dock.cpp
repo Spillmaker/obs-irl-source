@@ -20,6 +20,8 @@
  * bargain the websocket vendor already makes with obs-websocket.
  */
 
+#include <functional>
+
 #include <QAbstractButton>
 #include <QAbstractSpinBox>
 #include <QApplication>
@@ -35,14 +37,13 @@
 #include <QFrame>
 #include <QHBoxLayout>
 #include <QHeaderView>
-#include <QIcon>
 #include <QLabel>
 #include <QLineEdit>
 #include <QPalette>
+#include <QMouseEvent>
 #include <QPainter>
 #include <QPen>
 #include <QPushButton>
-#include <QSize>
 #include <QSpinBox>
 #include <QStyle>
 #include <QStyledItemDelegate>
@@ -359,30 +360,43 @@ static int widest_status_px(const QWidget *w)
 	return widest;
 }
 
-/* Borrow OBS's own gear rather than shipping one. The frontend stylesheet
- * attaches the artwork to these property selectors, so a button that declares
- * them picks up whatever the running theme uses on the Controls dock — and
- * follows the user's theme for free. The property name changed with the theme
- * engine in OBS 30.2, so both spellings are set; a theme that honours neither
- * leaves the icon null and gets the glyph instead. */
-static void applyGearIcon(QPushButton *button)
-{
-	button->setProperty("themeID", "configIconSmall");
-	button->setProperty("class", "icon-gear");
-	button->style()->unpolish(button);
-	button->style()->polish(button);
-
-	if (button->icon().isNull())
-		button->setText(QStringLiteral("⚙"));
-	else
-		button->setIconSize(QSize(16, 16));
-
-	button->setMaximumWidth(32);
-}
-
 /* ── Dock widget ──────────────────────────────────────────── */
 
 namespace {
+
+/* A label that opens something when clicked.
+ *
+ * The two settings this dock has are the NTP server and the offset, and both
+ * are already on screen as readouts. Putting a control next to a readout of the
+ * same number says the same thing twice, so the readout is the control: click
+ * the value you want to change. The pointing cursor is what advertises it,
+ * which is why the handler and the cursor are set together and never
+ * separately. */
+class ClickableLabel : public QLabel {
+public:
+	using QLabel::QLabel;
+
+	void setClickHandler(std::function<void()> handler)
+	{
+		onClick = std::move(handler);
+		setCursor(onClick ? Qt::PointingHandCursor : Qt::ArrowCursor);
+	}
+
+protected:
+	void mouseReleaseEvent(QMouseEvent *event) override
+	{
+		/* On release rather than press, and only inside the label, so a
+		 * click begun elsewhere and dragged on does not fire — the same
+		 * rule every button follows. */
+		if (event->button() == Qt::LeftButton && onClick &&
+		    rect().contains(event->pos()))
+			onClick();
+		QLabel::mouseReleaseEvent(event);
+	}
+
+private:
+	std::function<void()> onClick;
+};
 
 /* Marks a cell whose text is the short form of something longer by underlining
  * it with dots, the way a printed glossary term is marked.
@@ -468,26 +482,19 @@ public:
 	}
 
 private:
-	QLabel *serverCaption = nullptr;
+	ClickableLabel *serverCaption = nullptr;
 	QLabel *clockLabel = nullptr;
 	QLabel *ntpLabel = nullptr;
-	QLabel *offsetCaption = nullptr;
-	QLabel *offsetBadge = nullptr;
+	ClickableLabel *offsetCaption = nullptr;
+	ClickableLabel *offsetBadge = nullptr;
 	QLabel *showingLabel = nullptr;
 	QLabel *showingCaption = nullptr;
 	QLabel *summaryLabel = nullptr;
-	QSpinBox *offsetSpin = nullptr;
-	QPushButton *applyButton = nullptr;
 	QPushButton *masterButton = nullptr;
 	QTableWidget *table = nullptr;
 
 	int ticks = 0;
 	bool blinkOn = false;
-	/* The offset the spinbox was last synced to, so a change made anywhere
-	 * else can be told apart from one the user has typed but not applied —
-	 * the first should be adopted, the second must not be overwritten. */
-	int knownOffsetMs = 0;
-
 	void build()
 	{
 		auto *root = new QVBoxLayout(this);
@@ -510,8 +517,8 @@ private:
 	 * the same three rows on both sides, so the pair reads as two of the
 	 * same instrument showing two different times rather than as a heading
 	 * with a footnote. */
-	QFrame *buildClockCard(QWidget *parent, QLabel **caption, QLabel **digits,
-			       QLabel **status)
+	QFrame *buildClockCard(QWidget *parent, ClickableLabel **caption,
+			       QLabel **digits, QLabel **status)
 	{
 		auto *card = new QFrame(parent);
 		card->setObjectName(QStringLiteral("irlClockCard"));
@@ -520,7 +527,7 @@ private:
 		box->setContentsMargins(14, 9, 14, 9);
 		box->setSpacing(2);
 
-		*caption = new QLabel(card);
+		*caption = new ClickableLabel(card);
 		(*caption)->setObjectName(QStringLiteral("irlClockCaption"));
 		(*caption)->setTextFormat(Qt::RichText);
 		(*caption)->setStyleSheet(QStringLiteral(
@@ -582,6 +589,9 @@ private:
 		row->addWidget(buildClockCard(panel, &serverCaption, &clockLabel,
 					      &ntpLabel),
 			       1);
+		serverCaption->setClickHandler([this]() { openServerDialog(); });
+		serverCaption->setToolTip(
+			QStringLiteral("Change the NTP server"));
 
 		/* Right: what is on screen right now. Without it the reference
 		 * clock and the source timecodes differ by exactly the offset
@@ -592,8 +602,10 @@ private:
 		/* The offset rides in the right caption, as a badge: it is the
 		 * difference between the two faces, so it belongs on the face
 		 * that is behind rather than on a line of its own. */
-		offsetBadge = new QLabel(right);
+		offsetBadge = new ClickableLabel(right);
 		offsetBadge->setObjectName(QStringLiteral("irlOffsetBadge"));
+		offsetBadge->setClickHandler([this]() { openOffsetDialog(); });
+		offsetBadge->setToolTip(QStringLiteral("Change the offset"));
 		offsetBadge->setStyleSheet(
 			QString("#irlOffsetBadge { color: %1;"
 				" background-color: %2; border-radius: 4px;"
@@ -620,51 +632,12 @@ private:
 	{
 		auto *row = new QHBoxLayout();
 		row->setSpacing(6);
-
-		row->addWidget(new QLabel(QStringLiteral("Offset"), this));
-
-		/* Whole seconds. See IRL_SYNC_OFFSET_STEP_MS: this is the
-		 * number co-streamers agree on out loud, so the control offers
-		 * exactly the values that are worth saying. */
-		offsetSpin = new QSpinBox(this);
-		offsetSpin->setRange(IRL_SYNC_MIN_OFFSET_MS / 1000,
-				     IRL_SYNC_MAX_OFFSET_MS / 1000);
-		offsetSpin->setSuffix(QStringLiteral(" s"));
-		offsetSpin->setValue(irl_sync_offset_ms() / 1000);
-		offsetSpin->setFont(fixedFont(this));
-		knownOffsetMs = irl_sync_offset_ms();
-		QObject::connect(offsetSpin, &QSpinBox::valueChanged, this,
-				 [this](int) { updateApplyButton(); });
-		row->addWidget(offsetSpin);
-
-		/* Explicit, rather than applying on editingFinished as this
-		 * used to. Changing the offset is a several-second step for
-		 * every synced feed at once, so it should happen when someone
-		 * says so — not when they tab away, and not silently on a
-		 * keypress they have to know about. */
-		applyButton = new QPushButton(QStringLiteral("Update"), this);
-		applyButton->setToolTip(QStringLiteral(
-			"Apply the new offset to every synced source."));
-		/* Named on the declaring class: clicked is inherited, and
-		 * spelling the base out keeps the pointer-to-member
-		 * unambiguous. */
-		QObject::connect(applyButton, &QAbstractButton::clicked, this,
-				 [this]() {
-					 irl_sync_set_offset_ms(
-						 offsetSpin->value() * 1000);
-					 updateApplyButton();
-				 });
-		row->addWidget(applyButton);
-
 		row->addStretch(1);
 
-		auto *settingsButton = new QPushButton(this);
-		settingsButton->setToolTip(QStringLiteral("Sync settings"));
-		applyGearIcon(settingsButton);
-		QObject::connect(settingsButton, &QAbstractButton::clicked, this,
-				 [this]() { openSettings(); });
-		row->addWidget(settingsButton);
-
+		/* The master switch is all that is left here. The server and
+		 * the offset are edited by clicking the panel readouts that
+		 * already show them, rather than by a second copy of the same
+		 * two values sitting under the clock. */
 		masterButton = new QPushButton(this);
 		masterButton->setCheckable(true);
 		masterButton->setMinimumWidth(90);
@@ -755,14 +728,13 @@ private:
 			COL_SOURCE, QHeaderView::Stretch);
 	}
 
-	/* Modal and apply-on-OK, unlike the offset next to it. What lives here
-	 * is set once when the setup is built and then left alone, so it is
-	 * worth a deliberate confirmation and not worth the live round trip the
-	 * dock's own controls do. */
-	void openSettings()
+	/* Opened by clicking the server name on the reference clock. Modal and
+	 * apply-on-OK: this is set once when the setup is built and then left
+	 * alone, so it is worth a deliberate confirmation. */
+	void openServerDialog()
 	{
 		QDialog dialog(this);
-		dialog.setWindowTitle(QStringLiteral("IRL Sync Settings"));
+		dialog.setWindowTitle(QStringLiteral("NTP Server"));
 
 		auto *box = new QVBoxLayout(&dialog);
 		auto *form = new QFormLayout();
@@ -802,6 +774,54 @@ private:
 
 		irl_sync_set_ntp_server(
 			server->text().trimmed().toUtf8().constData());
+	}
+
+	/* Opened by clicking the offset badge. Modal and apply-on-OK for a
+	 * different reason than the server dialog: changing the offset is a
+	 * several-second step for every synced feed at once, so it should
+	 * happen when someone says so, not while they are still typing. */
+	void openOffsetDialog()
+	{
+		QDialog dialog(this);
+		dialog.setWindowTitle(QStringLiteral("Sync Offset"));
+
+		auto *box = new QVBoxLayout(&dialog);
+		auto *form = new QFormLayout();
+
+		/* Whole seconds. See IRL_SYNC_OFFSET_STEP_MS: this is the
+		 * number co-streamers agree on out loud, so the control offers
+		 * exactly the values that are worth saying. */
+		auto *spin = new QSpinBox(&dialog);
+		spin->setRange(IRL_SYNC_MIN_OFFSET_MS / 1000,
+			       IRL_SYNC_MAX_OFFSET_MS / 1000);
+		spin->setSuffix(QStringLiteral(" s"));
+		spin->setValue(irl_sync_offset_ms() / 1000);
+		spin->setFont(fixedFont(this));
+		form->addRow(QStringLiteral("Offset"), spin);
+		box->addLayout(form);
+
+		auto *note = new QLabel(
+			QStringLiteral(
+				"How far behind live every synced source plays.\n"
+				"Everyone sharing a shot needs the same number,\n"
+				"and it has to clear the slowest feed's latency."),
+			&dialog);
+		note->setStyleSheet(QString("color: %1;").arg(PANEL_DIM));
+		box->addWidget(note);
+
+		auto *buttons = new QDialogButtonBox(
+			QDialogButtonBox::Ok | QDialogButtonBox::Cancel,
+			&dialog);
+		QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog,
+				 &QDialog::accept);
+		QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog,
+				 &QDialog::reject);
+		box->addWidget(buttons);
+
+		if (dialog.exec() != QDialog::Accepted)
+			return;
+
+		irl_sync_set_offset_ms(spin->value() * 1000);
 	}
 
 	void updateMasterButton(bool enabled)
@@ -952,27 +972,12 @@ private:
 							  : PANEL_DIM));
 	}
 
-	void updateApplyButton()
-	{
-		applyButton->setEnabled(offsetSpin->value() * 1000 !=
-					irl_sync_offset_ms());
-	}
-
+	/* The offset needs no adopting here any more: the badge is redrawn from
+	 * the live config every tick, so a change made anywhere else — a scene
+	 * collection load, the websocket — shows up on its own. */
 	void refreshControls(const struct irl_sync_config &cfg)
 	{
 		updateMasterButton(cfg.enabled);
-
-		/* Adopt a change that came from somewhere else — a scene
-		 * collection load, or the websocket — but never overwrite one
-		 * the user has typed and not yet applied. */
-		if (cfg.offset_ms != knownOffsetMs) {
-			knownOffsetMs = cfg.offset_ms;
-			offsetSpin->blockSignals(true);
-			offsetSpin->setValue(cfg.offset_ms / 1000);
-			offsetSpin->blockSignals(false);
-		}
-
-		updateApplyButton();
 	}
 
 	void refreshTable()
