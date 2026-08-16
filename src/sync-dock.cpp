@@ -721,12 +721,22 @@ private:
 					 updateMasterSwitch(checked);
 				 });
 
+		auto *masterLabel = new QLabel(QStringLiteral("Sync on/off"),
+					       right);
+		masterLabel->setObjectName(QStringLiteral("irlClockStatus"));
+		masterLabel->setStyleSheet(statusStyle(PANEL_DIM));
+
+		/* Right, against the offset badge above it, so the two things
+		 * on this card that are controls rather than readouts line up
+		 * down the same edge. The status text keeps the left, where the
+		 * matching line on the reference card is. */
 		auto *foot = new QHBoxLayout();
 		foot->setContentsMargins(0, 0, 0, 0);
 		foot->setSpacing(8);
-		foot->addWidget(masterSwitch);
 		foot->addWidget(showingCaption);
 		foot->addStretch(1);
+		foot->addWidget(masterLabel);
+		foot->addWidget(masterSwitch);
 
 		rightBox->removeWidget(showingCaption);
 		rightBox->addLayout(foot);
