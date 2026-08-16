@@ -474,7 +474,7 @@ static void error_filter_reset(struct irl_source *ctx)
 	ctx->sync_error_count = 0;
 }
 
-/* Fold one presentation-error reading in and return the window median.
+/* Fold one presentation-error reading in and return the filtered window value.
  *
  * The per-packet reading carries about a frame of noise: it is the *predicted*
  * presentation time of one access unit, taken from an audio playout mapping
@@ -488,9 +488,14 @@ static void error_filter_reset(struct irl_source *ctx)
  * operator reads jittered by a frame while the alignment underneath it was
  * steady, which is not what a sync readout is for.
  *
- * Median rather than mean: a corrupt or mis-stamped timecode produces one
- * wildly wrong sample, and the median ignores it outright where a mean would
- * spread it across the whole window.
+ * A trimmed mean rather than a median. Both reject the one wildly wrong sample
+ * a corrupt or mis-stamped timecode produces, which is why this is not a plain
+ * mean — but a median *returns* one of the samples, so its output can only ever
+ * be a value the quantisation already permits. The correction is then quantised
+ * too, and the loop parks on the nearest step instead of on zero: a residual
+ * that sits still at a fraction of a frame and never walks off it. Averaging
+ * what is left after the tails are cut lands between the steps, so the loop can
+ * aim at zero.
  *
  * The window is bounded by time, not by sample count, so the filter behaves
  * identically on a 25fps feed and a 240fps one. See IRL_SYNC_ERROR_WINDOW_NS. */
@@ -500,8 +505,8 @@ static int64_t error_filter_push(struct irl_source *ctx, int64_t error_ns,
 	if (ctx->sync_error_count == IRL_SYNC_ERROR_SAMPLES) {
 		/* Full before the window expired: a rate above what the
 		 * interval bounds accept, or timecodes on every field of an
-		 * interlaced feed. Dropping the oldest keeps it a median of
-		 * the most recent second's worth either way. */
+		 * interlaced feed. Dropping the oldest keeps the window to the
+		 * most recent second's worth either way. */
 		ctx->sync_error_head =
 			(ctx->sync_error_head + 1) % IRL_SYNC_ERROR_SAMPLES;
 		ctx->sync_error_count--;
@@ -531,11 +536,22 @@ static int64_t error_filter_push(struct irl_source *ctx, int64_t error_ns,
 	qsort(sorted, (size_t)ctx->sync_error_count, sizeof(sorted[0]),
 	      cmp_int64);
 
-	/* Lower median on an even count. The half-sample of bias that costs is
-	 * far below the noise this exists to remove, and it avoids averaging
-	 * the two middle samples — which would reintroduce a mean, and with it
-	 * the outlier sensitivity the median is here to avoid. */
-	return sorted[ctx->sync_error_count / 2];
+	/* A tenth off each end, which is enough to lose a corrupt timecode
+	 * without losing the shape of the distribution. Below ten samples a
+	 * tenth rounds to nothing, so trim one instead: a window that small is
+	 * a feed that has only just started, and one bad sample in three would
+	 * otherwise pass straight through. The count kept is never less than
+	 * one — at three samples this is exactly the median again. */
+	int trim = ctx->sync_error_count / 10;
+	if (trim == 0 && ctx->sync_error_count >= 3)
+		trim = 1;
+
+	const int kept = ctx->sync_error_count - 2 * trim;
+	int64_t sum = 0;
+	for (int i = trim; i < trim + kept; i++)
+		sum += sorted[i];
+
+	return sum / kept;
 }
 
 /* The smallest offset the control can be set to that still clears `peak_ms`.
@@ -787,7 +803,7 @@ static void observe_timecode(struct irl_source *ctx, const AVPacket *pkt,
 		ctx->sync_offset_generation = generation;
 		ctx->sync_locked = false;
 		/* The target just moved by seconds. Every sample in the window
-		 * describes the old one, and a median of stale readings would
+		 * describes the old one, and an average of stale readings would
 		 * hold the loop back from a change the user asked for. */
 		error_filter_reset(ctx);
 	}

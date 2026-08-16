@@ -143,7 +143,7 @@ Sync ticked, and shows:
 - **Added** — how much extra hold the plugin is applying to reach the target.
 - **Drift** — how far the actual presentation lands from the target. Near zero
   once locked, and a residual rather than a fault: the loop is what corrects
-  it. Median-filtered over about a second, because the per-packet reading
+  it. Averaged over about a second, because the per-packet reading
   carries roughly a frame of noise that the alignment underneath it does not.
 
 Changing the offset takes effect when you press **Update**, not as you type:
@@ -498,7 +498,7 @@ Stats are exposed through OBS's `proc_handler` API under the `get_stats` call, a
 | `sync_latency_ms` | int | How stale the freshest received frame is, from its timecode against NTP |
 | `sync_latency_peak_ms` | int | Rolling 60s maximum of the above. Pick an offset against this, not the instantaneous value |
 | `sync_added_ms` | int | Extra hold currently applied to reach the target presentation time |
-| `sync_error_ms` | int | How far the actual presentation lands from the target, median-filtered over about a second. Near zero when locked. Shown in the dock as **Drift** |
+| `sync_error_ms` | int | How far the actual presentation lands from the target, averaged over about a second. Near zero when locked. Shown in the dock as **Drift** |
 | `sync_required_offset_ms` | int | Smallest offset at which this source could hold sync: its peak latency rounded up to a whole second |
 
 ### OBS log stats

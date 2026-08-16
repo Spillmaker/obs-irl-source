@@ -56,7 +56,7 @@ struct irl_source;
  * receiver-sync.c sets the bucket duration. */
 #define IRL_SYNC_PEAK_BUCKETS 12
 
-/* How long the presentation error is median-filtered over. See
+/* How long the presentation error is averaged over. See
  * error_filter_push().
  *
  * A duration, not a sample count, because sources run at anything from 25 to

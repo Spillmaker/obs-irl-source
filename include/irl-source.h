@@ -549,7 +549,7 @@ struct irl_source {
 	 * actuator: everything else about sync is measurement. */
 	int64_t sync_hold_ns;
 	int64_t sync_latency_ns;
-	/* Median of the readings in the window, not the last one. See
+	/* Trimmed mean of the readings in the window, not the last one. See
 	 * error_filter_push(). Ring, oldest at sync_error_head; the timestamps
 	 * are what bound it by time rather than by sample count. */
 	int64_t sync_error_ns;
