@@ -5,12 +5,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 cmake_minimum_required(VERSION 3.16)
-# CXX is declared here rather than probed with check_language() and enabled
-# on demand: that probe returns NOTFOUND under the Visual Studio generator even
-# where MSVC compiles C++ perfectly well, which silently cost the sync dock on
-# Windows. Declaring it costs nothing — the bundled deps already need a C++
-# compiler for libsrt — and IRL_ENABLE_DOCK still controls whether any C++ of
-# ours is actually built.
+# Declared CXX here because it wasn't found otherwise.
 project(obs-irl-source VERSION 1.3.1 LANGUAGES C CXX)
 
 set(OBS_IRL_SOURCE_BUILD_VERSION "${PROJECT_VERSION}")
@@ -30,14 +25,7 @@ if(Git_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
     endif()
 endif()
 
-# Normalise to forward slashes before this is used anywhere.
-#
-# Windows callers pass -DOBS_SOURCE_DIR=%CD%\obs-src, and CMake writes
-# CMAKE_MODULE_PATH verbatim into the CMakeLists it generates for
-# try_compile(), where CMake 4.x rejects `\a` as an invalid character escape.
-# Any find_package that probes by compiling then fails to configure — which is
-# exactly what Qt6 does, via FindThreads. Forward slashes are accepted
-# everywhere, so converting once here covers every use below.
+# Make sure the OBS_SOURCE_DIR path uses the same expected slashes as cmake expect.
 if(DEFINED OBS_SOURCE_DIR)
     file(TO_CMAKE_PATH "${OBS_SOURCE_DIR}" OBS_SOURCE_DIR)
 elseif(DEFINED ENV{OBS_SOURCE_DIR})
@@ -59,7 +47,6 @@ if(libobs_FOUND)
 else()
     set(_OBS_USE_FIND_PACKAGE OFF)
 
-    # Fall back to the manual OBS_SOURCE_DIR approach.
     set(_OBS_INCLUDE_DIRS "")
     set(_OBS_LIB_DIRS "")
 
@@ -296,29 +283,25 @@ set(PLUGIN_SOURCES
     src/receiver-audio.c
     src/receiver-decode.c
     src/receiver-stream.c
-    src/sync/sync-control.c
     src/receiver-video.c
     src/audio-buffer.c
-    src/sync/sync-ntp.c
-    src/sync/sync-sei.c
-    src/sync/sync-config.c
     src/video-handler.c
     src/pts-repair.c
     src/settings.c
     src/websocket-vendor.c
+
+    # IRLSync
+    src/sync/sync-control.c
+    src/sync/sync-ntp.c
+    src/sync/sync-sei.c
+    src/sync/sync-config.c
 )
 
-# ── Sync dock (optional) ─────────────────────────────────────
-#
-# The dock is the only part of the plugin that needs Qt, and the only C++.
-# It is optional so a build without Qt still produces a working plugin: sync
-# itself runs headless, and its status stays reachable over the obs-websocket
-# vendor. obs-frontend-api is deliberately not linked — sync-dock.cpp resolves
-# the two symbols it needs at runtime, which keeps the CI's libobs-only OBS
-# build from having to grow the whole Qt frontend.
+# Since the UI for IRLSync requires QT which was previously not included in this project
+# the UI itself is optional.
 option(IRL_ENABLE_DOCK "Build the IRL Sync dock (requires Qt6 Widgets)" ON)
-
 set(_IRL_DOCK OFF)
+
 if(IRL_ENABLE_DOCK)
     find_package(Qt6 QUIET COMPONENTS Widgets)
     if(Qt6_FOUND)
@@ -341,8 +324,6 @@ if(_IRL_DOCK)
     target_compile_definitions(obs-irl-source PRIVATE IRL_ENABLE_DOCK)
     target_compile_features(obs-irl-source PRIVATE cxx_std_17)
     target_link_libraries(obs-irl-source PRIVATE Qt6::Widgets)
-    # dlsym() for the obs-frontend-api entry points. Empty on platforms that
-    # keep it in libc, and unused on Windows (GetProcAddress).
     if(NOT WIN32)
         target_link_libraries(obs-irl-source PRIVATE ${CMAKE_DL_LIBS})
     endif()
@@ -460,9 +441,7 @@ else()
         -Wall -Wextra
         -Wno-unused-parameter
     )
-    # C only: libobs's own headers use anonymous structs, which ISO C++
-    # prohibits, so -Wpedantic on the dock's translation unit reports nothing
-    # but noise from headers we do not own.
+    # Removing noisy compiler warnings for when we compile c++. (The dock)
     target_compile_options(obs-irl-source PRIVATE
         $<$<COMPILE_LANGUAGE:C>:-Wpedantic>
     )
