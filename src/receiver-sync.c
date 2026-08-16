@@ -163,6 +163,22 @@ static bool delay_full(const struct irl_packet_delay *delay)
 	       delay->bytes >= IRL_SYNC_DELAY_MAX_BYTES;
 }
 
+/* Move every queued packet's release time later by the same amount.
+ *
+ * Only ever later. Shifting earlier would make the whole line due at once,
+ * which is the burst SYNC_RELEASE_RATE exists to prevent. Later opens a gap in
+ * the line, so it is safe exactly when something downstream is holding enough
+ * to cover the gap — which is the one case it is used for. See
+ * apply_anchor_defer(). */
+static void delay_shift_later(struct irl_packet_delay *delay, int64_t shift_ns)
+{
+	for (int i = 0; i < delay->count; i++) {
+		const int idx = (delay->head + i) % IRL_SYNC_DELAY_MAX_PACKETS;
+		delay->entries[idx].release_ns += (uint64_t)shift_ns;
+	}
+	delay->last_release_ns += (uint64_t)shift_ns;
+}
+
 static bool delay_push(struct irl_packet_delay *delay, AVPacket *pkt,
 		       uint64_t release_ns)
 {
@@ -623,7 +639,9 @@ void irl_sync_reset(struct irl_source *ctx)
 	irl_mutex_lock(&ctx->audio_state_lock);
 	ctx->sync_present_bias_ns = 0;
 	ctx->sync_present_bias_valid = false;
+	ctx->sync_anchor_defer_ns = 0;
 	irl_mutex_unlock(&ctx->audio_state_lock);
+	os_atomic_set_bool(&ctx->sync_anchor_defer_pending, false);
 
 	ctx->sync_engaged = false;
 	ctx->sync_seed_reported = false;
@@ -982,11 +1000,15 @@ static void observe_timecode(struct irl_source *ctx, const AVPacket *pkt,
 	 * pipeline delay rather than running to IRL_SYNC_MAX_OFFSET_MS and
 	 * parking the stream half a minute behind.
 	 *
-	 * Plus the seed bias, because that overshoot is deliberate and the
-	 * default buffer target is smaller than it — without the allowance the
-	 * ceiling would clamp the bias off in the same call that set it. */
+	 * Plus headroom, because two of the overshoots above it are deliberate
+	 * and one of them is not even physically bounded by zero: the startup
+	 * backlog trim discards audio after sync has chosen its hold, so the
+	 * pipeline it is subtracting can genuinely come out negative. The
+	 * allowance is exactly what the two can add — the seed bias, and the
+	 * largest pre-roll the anchor is allowed to hand back. */
 	int64_t max_hold_ns = needed_ns > 0
-				      ? needed_ns + SYNC_SEED_BIAS_NS
+				      ? needed_ns + SYNC_SEED_BIAS_NS +
+						SYNC_ANCHOR_MAX_WAIT_NS
 				      : 0;
 	if (ctx->sync_hold_ns > max_hold_ns)
 		ctx->sync_hold_ns = max_hold_ns;
@@ -1079,13 +1101,61 @@ bool irl_sync_playout_anchor(struct irl_source *ctx, int64_t pts_ns,
 	if (wait_ns <= 0 || wait_ns > SYNC_ANCHOR_MAX_WAIT_NS)
 		return false;
 
+	/* Hand the wait back so the delay line can absorb it. */
+	irl_mutex_lock(&ctx->audio_state_lock);
+	ctx->sync_anchor_defer_ns = wait_ns;
+	irl_mutex_unlock(&ctx->audio_state_lock);
+	os_atomic_set_bool(&ctx->sync_anchor_defer_pending, true);
+
 	*anchor_ns = (uint64_t)placed_ns;
 	return true;
+}
+
+/* Take over the pre-roll the audio output is sitting out before it starts.
+ *
+ * The anchor places the output clock exactly, and whatever wait that implies
+ * has to be absorbed somewhere. Left alone it lands in the jitter buffer, which
+ * then starts playback several hundred milliseconds above target — and the
+ * speed controller drains that excess at +5%, which pulls the playout earlier
+ * and unwinds the placement it was there to make.
+ *
+ * So the delay line takes it instead. Pausing the input for the same window the
+ * output is waiting leaves the buffer exactly where it was, with nothing for
+ * the speed controller to do. Safe here specifically because nothing is playing
+ * yet: the gap this opens is one the output is already waiting through. */
+static void apply_anchor_defer(struct irl_source *ctx, uint64_t now_ns)
+{
+	if (!os_atomic_load_bool(&ctx->sync_anchor_defer_pending))
+		return;
+
+	irl_mutex_lock(&ctx->audio_state_lock);
+	const int64_t defer_ns = ctx->sync_anchor_defer_ns;
+	ctx->sync_anchor_defer_ns = 0;
+	irl_mutex_unlock(&ctx->audio_state_lock);
+	os_atomic_set_bool(&ctx->sync_anchor_defer_pending, false);
+
+	if (defer_ns <= 0)
+		return;
+
+	ctx->sync_hold_ns += defer_ns;
+	delay_shift_later(&ctx->sync_delay, defer_ns);
+
+	/* The queued packets moved with the hold, so this change is already at
+	 * the line's output rather than a hold away from it. The gate only has
+	 * to cover the rest of the pipeline. */
+	ctx->sync_settle_until_ns = now_ns + SYNC_SETTLE_MARGIN_NS;
+
+	blog(LOG_INFO,
+	     "[irl-source] Sync: delay line took over the %lldms pre-roll; holding %lldms",
+	     (long long)(defer_ns / 1000000LL),
+	     (long long)(ctx->sync_hold_ns / 1000000LL));
 }
 
 void irl_sync_observe(struct irl_source *ctx, const AVPacket *pkt)
 {
 	uint64_t now_ns = os_gettime_ns();
+
+	apply_anchor_defer(ctx, now_ns);
 
 	/* First packet of the stream: start the clock the gate runs against.
 	 * Here rather than in irl_sync_reset because reset has no `now`, and

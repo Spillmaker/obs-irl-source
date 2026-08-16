@@ -565,6 +565,13 @@ struct irl_source {
 	 * See irl_sync_playout_anchor(). */
 	int64_t sync_present_bias_ns;
 	bool sync_present_bias_valid;
+	/* Pre-roll the audio output is waiting out before it starts, handed
+	 * back so the delay line absorbs it instead of the jitter buffer. The
+	 * flag is atomic so the receiver thread can skip the lock on the
+	 * packets where there is nothing to collect, which is nearly all of
+	 * them; the value itself is guarded by audio_state_lock. */
+	int64_t sync_anchor_defer_ns;
+	bool sync_anchor_defer_pending;
 	/* Cleared at engage, set when the first correction after it is made,
 	 * so how far the seed missed is logged once rather than every packet.
 	 * See SYNC_SEED_BIAS_NS. */
