@@ -88,21 +88,19 @@ static constexpr const char *PANEL_FAULT = "#f85149";
 static constexpr const char *PANEL_WARN = "#e3b341";
 static constexpr const char *PANEL_WARN_BG = "#3a2c0b";
 
-/* Panel type sizes, in pixels.
+/* Height of the clock digits, in pixels. Fixed rather than derived from the UI
+ * font, for the same reason the palette above is fixed: this is an instrument
+ * face, and an instrument's digits are the size they are. Everything else in
+ * the panel keeps the theme's font, so this gap is also what marks the digits
+ * out as the thing to look at.
  *
- * Fixed rather than derived from the UI font, for the same reason the palette
- * above is fixed: this is an instrument face, and an instrument's digits are
- * the size they are. The gap between the digits and everything around them is
- * what makes the panel read as one, so it is deliberately large.
- *
- * These go through each widget's own stylesheet, never QWidget::setFont, and
- * every rule carries an ID selector. setFont loses outright — a font-size in
- * the OBS theme's application stylesheet overrides it — and a bare declaration
- * in a widget stylesheet loses to any themed rule more specific than a type
- * selector. An ID rule on the widget itself outranks both. */
+ * It goes through the label's own stylesheet, never QWidget::setFont, and the
+ * rule carries an ID selector. setFont loses outright — a font-size in the OBS
+ * theme's application stylesheet overrides it, which left the digits at the
+ * theme's size — and a bare declaration in a widget stylesheet loses to any
+ * themed rule more specific than a type selector. An ID rule on the widget
+ * itself outranks both. */
 static constexpr int DIGIT_PX = 30;
-static constexpr int CAPTION_PX = 12;
-static constexpr int STATUS_PX = 12;
 
 /* ── Frontend entry points ────────────────────────────────── */
 
@@ -148,23 +146,21 @@ static QString fixedFamily()
 	return QFontDatabase::systemFont(QFontDatabase::FixedFont).family();
 }
 
-static QString panelFontCss(int px, bool bold)
-{
-	return QString("font-family: \"%1\"; font-size: %2px;"
-		       " font-weight: %3;")
-		.arg(fixedFamily())
-		.arg(px)
-		.arg(bold ? "bold" : "normal");
-}
-
 /* One clock face, whole. The milliseconds are the same size and weight as the
  * seconds: a clock reads as a clock because its digits are one run, and setting
- * part of it smaller turns the readout into a number with a footnote. */
+ * part of it smaller turns the readout into a number with a footnote.
+ *
+ * The digits are the only thing in this panel that leaves the theme's font.
+ * They have to: they change in place, and a proportional face makes them shift
+ * sideways every tick. Everything else around them is ordinary UI text and is
+ * left in whatever the running OBS theme uses. */
 static QString digitStyle(const char *colour)
 {
 	return QString("#irlClockDigits { color: %1; background: transparent;"
-		       " border: none; %2 }")
-		.arg(colour, panelFontCss(DIGIT_PX, true));
+		       " border: none; font-family: \"%2\";"
+		       " font-size: %3px; font-weight: bold; }")
+		.arg(colour, fixedFamily())
+		.arg(DIGIT_PX);
 }
 
 /* A caption's leading dot, coloured by what it is reporting on. Carries the
@@ -465,10 +461,9 @@ private:
 		*caption = new QLabel(card);
 		(*caption)->setObjectName(QStringLiteral("irlClockCaption"));
 		(*caption)->setTextFormat(Qt::RichText);
-		(*caption)->setStyleSheet(
-			QString("#irlClockCaption { background: transparent;"
-				" border: none; %1 }")
-				.arg(panelFontCss(CAPTION_PX, true)));
+		(*caption)->setStyleSheet(QStringLiteral(
+			"#irlClockCaption { background: transparent;"
+			" border: none; font-weight: bold; }"));
 
 		/* Plain text, so nothing about the digits is negotiable: rich
 		 * text would let a stray tag resize part of the face. */
@@ -490,8 +485,8 @@ private:
 		(*status)->setTextFormat(Qt::RichText);
 		(*status)->setStyleSheet(
 			QString("#irlClockStatus { color: %1;"
-				" background: transparent; border: none; %2 }")
-				.arg(PANEL_DIM, panelFontCss(STATUS_PX, false)));
+				" background: transparent; border: none; }")
+				.arg(PANEL_DIM));
 
 		box->addWidget(*caption);
 		box->addWidget(*digits);
@@ -543,9 +538,8 @@ private:
 		offsetBadge->setStyleSheet(
 			QString("#irlOffsetBadge { color: %1;"
 				" background-color: %2; border-radius: 4px;"
-				" padding: 1px 6px; %3 }")
-				.arg(PANEL_WARN, PANEL_WARN_BG,
-				     panelFontCss(CAPTION_PX, true)));
+				" padding: 1px 6px; font-weight: bold; }")
+				.arg(PANEL_WARN, PANEL_WARN_BG));
 
 		auto *head = new QHBoxLayout();
 		head->setContentsMargins(0, 0, 0, 0);
