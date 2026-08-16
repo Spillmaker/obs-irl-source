@@ -557,6 +557,10 @@ struct irl_source {
 	uint64_t sync_error_time[IRL_SYNC_ERROR_SAMPLES];
 	int sync_error_head;
 	int sync_error_count;
+	/* Cleared at engage, set when the first correction after it is made,
+	 * so how far the seed missed is logged once rather than every packet.
+	 * See SYNC_SEED_BIAS_NS. */
+	bool sync_seed_reported;
 	/* Offset the current hold was computed against, plus the generation
 	 * counter that says the user has changed it since. */
 	int sync_applied_offset_ms;

@@ -77,6 +77,22 @@
 /* No timecode for this long and the source has stopped being alignable. */
 #define SYNC_TC_STALE_NS 3000000000ULL
 
+/* Deliberate over-hold at engage.
+ *
+ * The seed can only estimate this machine's pipeline, and whatever it misses
+ * by is what the loop then grinds off. Which side it misses on decides how
+ * long that takes, because the two directions are not the same speed: a source
+ * that started too late is pulled in by draining the jitter buffer, which the
+ * speed controller does at +5%, and one that started too early has to be
+ * pushed back by rebuilding that buffer at -2%. Same error, two and a half
+ * times the wait — and the slow direction is the one the seed was landing on.
+ *
+ * So the seed is deliberately generous, and the ceiling below makes room for
+ * exactly this much overshoot rather than clamping it straight back off. The
+ * cost of overshooting is paid at the fast rate; the cost of undershooting is
+ * paid at the slow one, so the two are not worth balancing. */
+#define SYNC_SEED_BIAS_NS 250000000LL
+
 /* Longest the audio output is kept from priming while sync works out its hold.
  *
  * The seed at engage is a step of whatever the offset needs — seconds, often —
@@ -591,6 +607,7 @@ void irl_sync_reset(struct irl_source *ctx)
 	delay_clear(&ctx->sync_delay);
 
 	ctx->sync_engaged = false;
+	ctx->sync_seed_reported = false;
 	ctx->sync_status = IRL_SYNC_OFF;
 	ctx->sync_tc_reason = IRL_SYNC_TC_OK;
 	ctx->sync_have_tc = false;
@@ -773,16 +790,18 @@ static void observe_timecode(struct irl_source *ctx, const AVPacket *pkt,
 	/* Engage: seed the hold so the pipeline primes already delayed,
 	 * instead of priming undelayed and then taking a multi-second step
 	 * that would starve the decoder. The nominal pipeline delay is the
-	 * jitter cushion plus the output lead — the rest of the error is what
-	 * the loop below is for. */
+	 * jitter cushion; the rest of the error is what the loop below is for,
+	 * biased onto the cheap side of zero. See SYNC_SEED_BIAS_NS. */
 	if (!ctx->sync_engaged) {
 		int64_t nominal_pipeline_ns =
 			os_atomic_load_long(&ctx->config.buffer_target_ms) *
 			1000000LL;
 
-		ctx->sync_hold_ns = needed_ns - nominal_pipeline_ns;
+		ctx->sync_hold_ns = needed_ns - nominal_pipeline_ns +
+				    SYNC_SEED_BIAS_NS;
 		if (ctx->sync_hold_ns < 0)
 			ctx->sync_hold_ns = 0;
+		ctx->sync_seed_reported = false;
 		ctx->sync_engaged = true;
 		ctx->sync_locked = false;
 		ctx->sync_applied_offset_ms = irl_sync_offset_ms();
@@ -798,10 +817,11 @@ static void observe_timecode(struct irl_source *ctx, const AVPacket *pkt,
 					      SYNC_PRIME_WAIT_NS;
 
 		blog(LOG_INFO,
-		     "[irl-source] Sync engaged: %.2ffps (from %s), feed latency %lldms, offset %dms, holding %lldms",
+		     "[irl-source] Sync engaged: %.2ffps (from %s), feed latency %lldms, offset %dms, holding %lldms (%lldms of that is seed bias)",
 		     1000000000.0 / (double)frame_interval_ns, interval_origin,
 		     (long long)(latency_ns / 1000000LL), irl_sync_offset_ms(),
-		     (long long)(ctx->sync_hold_ns / 1000000LL));
+		     (long long)(ctx->sync_hold_ns / 1000000LL),
+		     (long long)(SYNC_SEED_BIAS_NS / 1000000LL));
 	}
 
 	/* The user turned the offset knob. Step by the delta rather than
@@ -871,6 +891,20 @@ static void observe_timecode(struct irl_source *ctx, const AVPacket *pkt,
 
 			ctx->sync_hold_ns += step_ns;
 			ctx->sync_last_adjust_ns = now_ns;
+
+			/* The first reading after engage is how far the seed
+			 * actually missed, and its sign says whether the bias
+			 * is doing its job: positive means the source started
+			 * late, which is the direction that corrects at +5%.
+			 * Said once per engage, so it costs nothing. */
+			if (!ctx->sync_seed_reported) {
+				ctx->sync_seed_reported = true;
+				blog(LOG_INFO,
+				     "[irl-source] Sync seed missed by %lldms (%s); correcting",
+				     (long long)(ctx->sync_error_ns / 1000000LL),
+				     ctx->sync_error_ns >= 0 ? "late, fast to fix"
+							     : "early, slow to fix");
+			}
 		}
 	}
 
@@ -880,8 +914,14 @@ static void observe_timecode(struct irl_source *ctx, const AVPacket *pkt,
 	 * negative, so the hold can never legitimately exceed what is still
 	 * needed. Bounding it here means a misbehaving loop overshoots by the
 	 * pipeline delay rather than running to IRL_SYNC_MAX_OFFSET_MS and
-	 * parking the stream half a minute behind. */
-	int64_t max_hold_ns = needed_ns > 0 ? needed_ns : 0;
+	 * parking the stream half a minute behind.
+	 *
+	 * Plus the seed bias, because that overshoot is deliberate and the
+	 * default buffer target is smaller than it — without the allowance the
+	 * ceiling would clamp the bias off in the same call that set it. */
+	int64_t max_hold_ns = needed_ns > 0
+				      ? needed_ns + SYNC_SEED_BIAS_NS
+				      : 0;
 	if (ctx->sync_hold_ns > max_hold_ns)
 		ctx->sync_hold_ns = max_hold_ns;
 	if (ctx->sync_hold_ns < 0)
