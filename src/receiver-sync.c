@@ -706,9 +706,16 @@ static void update_status(struct irl_source *ctx, uint64_t now_ns,
 					    : IRL_SYNC_ACQUIRING;
 }
 
-/* Fold one timecoded video packet into the controller. */
+/* Fold one timecoded video packet in.
+ *
+ * With `control` clear this measures and reports but changes nothing: the
+ * stamp, the arrival latency and the peak are all still worth having while
+ * sync is switched off, because they are what the operator looks at to decide
+ * whether to switch it on — is this sender stamping at all, and what offset
+ * would it need. The controller stays out of it, and the status stays Off. */
 static void observe_timecode(struct irl_source *ctx, const AVPacket *pkt,
-			     const struct irl_timecode *tc, uint64_t now_ns)
+			     const struct irl_timecode *tc, uint64_t now_ns,
+			     bool control)
 {
 	tc_rate_observe(ctx, tc);
 
@@ -724,6 +731,8 @@ static void observe_timecode(struct irl_source *ctx, const AVPacket *pkt,
 		ctx->sync_tc = *tc;
 		ctx->sync_have_tc = true;
 		ctx->sync_last_tc_ns = now_ns;
+		if (!control)
+			return;
 		set_tc_reason(ctx, IRL_SYNC_TC_OK);
 		ctx->sync_status = IRL_SYNC_ACQUIRING;
 		return;
@@ -733,18 +742,23 @@ static void observe_timecode(struct irl_source *ctx, const AVPacket *pkt,
 	if (!timecode_latency_ns(tc, frame_interval_ns, &latency_ns)) {
 		/* Timecodes are arriving but there is no NTP reference to
 		 * compare them against, so nothing can be aligned. */
+		if (!control)
+			return;
 		ctx->sync_status = IRL_SYNC_NO_TIMECODE;
 		set_tc_reason(ctx, IRL_SYNC_TC_NO_CLOCK);
 		return;
 	}
-
-	set_tc_reason(ctx, IRL_SYNC_TC_OK);
 
 	ctx->sync_tc = *tc;
 	ctx->sync_have_tc = true;
 	ctx->sync_last_tc_ns = now_ns;
 	ctx->sync_latency_ns = latency_ns;
 	peak_record(ctx, latency_ns, now_ns);
+
+	if (!control)
+		return;
+
+	set_tc_reason(ctx, IRL_SYNC_TC_OK);
 
 	const int64_t prev_hold_ns = ctx->sync_hold_ns;
 	const int64_t elapsed_ns =
@@ -948,22 +962,17 @@ void irl_sync_observe(struct irl_source *ctx, const AVPacket *pkt)
 	if (ctx->sync_prime_deadline_ns == 0)
 		ctx->sync_prime_deadline_ns = now_ns + SYNC_PRIME_WAIT_NS;
 
-	if (!sync_wanted(ctx)) {
-		if (ctx->sync_status != IRL_SYNC_OFF) {
-			ctx->sync_status = IRL_SYNC_OFF;
-			ctx->sync_tc_reason = IRL_SYNC_TC_OK;
-			ctx->sync_have_tc = false;
-			ctx->sync_error_ns = 0;
-			ctx->sync_locked = false;
-			publish(ctx);
-		}
-		/* Whatever hold was built up is handed back gradually rather
-		 * than dropped in one go. Stays engaged=false so re-enabling
-		 * re-seeds from scratch. */
-		ctx->sync_engaged = false;
-		release_hold(ctx, now_ns);
-		update_prime_gate(ctx, now_ns);
-		return;
+	/* Whether the controller may act. Reading the timecodes does not
+	 * depend on it: a source that is switched off still reports what it is
+	 * receiving, which is the only way to tell a sender that is not
+	 * stamping from one that is and simply has not been turned on yet. */
+	const bool control = sync_wanted(ctx);
+
+	if (!control && ctx->sync_status != IRL_SYNC_OFF) {
+		ctx->sync_status = IRL_SYNC_OFF;
+		ctx->sync_tc_reason = IRL_SYNC_TC_OK;
+		ctx->sync_error_ns = 0;
+		ctx->sync_locked = false;
 	}
 
 	if (pkt->stream_index == ctx->video_stream_idx && pkt->data &&
@@ -971,21 +980,33 @@ void irl_sync_observe(struct irl_source *ctx, const AVPacket *pkt)
 		struct irl_timecode tc;
 
 		if (irl_sei_find_timecode(pkt->data, (size_t)pkt->size, &tc))
-			observe_timecode(ctx, pkt, &tc, now_ns);
+			observe_timecode(ctx, pkt, &tc, now_ns, control);
 	}
+
+	/* Whatever hold was built up is handed back gradually rather than
+	 * dropped in one go. Stays engaged=false so re-enabling re-seeds from
+	 * scratch. */
+	bool give_back_hold = !control;
 
 	/* No timecode for a while: either the sender never sends them or it
 	 * stopped. Both leave the source unalignable, and the delay line has
 	 * to let go rather than hold a stale amount forever. */
 	if (ctx->sync_last_tc_ns == 0 ||
 	    now_ns - ctx->sync_last_tc_ns > SYNC_TC_STALE_NS) {
-		if (ctx->sync_status != IRL_SYNC_NO_TIMECODE) {
+		if (control && ctx->sync_status != IRL_SYNC_NO_TIMECODE) {
 			ctx->sync_status = IRL_SYNC_NO_TIMECODE;
-			ctx->sync_have_tc = false;
 			ctx->sync_error_ns = 0;
 			ctx->sync_locked = false;
 		}
-		set_tc_reason(ctx, diagnose_missing_timecode(ctx));
+		if (control)
+			set_tc_reason(ctx, diagnose_missing_timecode(ctx));
+		/* Nothing left to display either, so the stamp goes with it —
+		 * a frozen timecode is worse than none. */
+		ctx->sync_have_tc = false;
+		give_back_hold = true;
+	}
+
+	if (give_back_hold) {
 		ctx->sync_engaged = false;
 		release_hold(ctx, now_ns);
 	}

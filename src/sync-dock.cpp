@@ -154,6 +154,13 @@ static QString fixedFamily()
  * They have to: they change in place, and a proportional face makes them shift
  * sideways every tick. Everything else around them is ordinary UI text and is
  * left in whatever the running OBS theme uses. */
+static QString statusStyle(const char *colour)
+{
+	return QString("#irlClockStatus { color: %1; background: transparent;"
+		       " border: none; }")
+		.arg(colour);
+}
+
 static QString digitStyle(const char *colour)
 {
 	return QString("#irlClockDigits { color: %1; background: transparent;"
@@ -161,13 +168,6 @@ static QString digitStyle(const char *colour)
 		       " font-size: %3px; font-weight: bold; }")
 		.arg(colour, fixedFamily())
 		.arg(DIGIT_PX);
-}
-
-/* A caption's leading dot, coloured by what it is reporting on. Carries the
- * state at a glance for anyone not reading the words after it. */
-static QString status_dot(const char *colour)
-{
-	return QString("<span style='color:%1;'>&#9679;</span> ").arg(colour);
 }
 
 /* Character counts every measured cell is padded out to, and every measured
@@ -225,7 +225,10 @@ static QString format_timecode(const struct irl_sync_snapshot &snap)
 		   TC_CHARS);
 }
 
-/* Colour and wording per state. Four states rather than red/green, because
+/* Colour and wording per state. The colour carries the state, so the wording
+ * does not repeat it with a bullet — only the two states that want the
+ * operator to do something keep a marker. Four states rather than red/green,
+ * because
  * they call for different actions: "No timecode" is a sender configuration
  * problem the offset cannot fix, "Acquiring" is the normal path to Locked and
  * must not read as a fault, and only "Too slow" is something the operator can
@@ -269,9 +272,9 @@ static QString status_text(const struct irl_sync_snapshot &snap)
 {
 	switch (snap.status) {
 	case IRL_SYNC_LOCKED:
-		return QStringLiteral("● Locked");
+		return QStringLiteral("Locked");
 	case IRL_SYNC_ACQUIRING:
-		return QStringLiteral("● Acquiring…");
+		return QStringLiteral("Acquiring…");
 	case IRL_SYNC_TOO_SLOW:
 		/* The number is the point: it tells the operator whether to
 		 * raise the offset themselves or call the person in the field. */
@@ -280,10 +283,10 @@ static QString status_text(const struct irl_sync_snapshot &snap)
 	case IRL_SYNC_STALE:
 		return QStringLiteral("▲ No data");
 	case IRL_SYNC_NO_TIMECODE:
-		return QStringLiteral("○ ") + no_timecode_text(snap.tc_reason);
+		return no_timecode_text(snap.tc_reason);
 	case IRL_SYNC_OFF:
 	default:
-		return QStringLiteral("○ Off");
+		return QStringLiteral("Off");
 	}
 }
 
@@ -483,10 +486,7 @@ private:
 		*status = new QLabel(card);
 		(*status)->setObjectName(QStringLiteral("irlClockStatus"));
 		(*status)->setTextFormat(Qt::RichText);
-		(*status)->setStyleSheet(
-			QString("#irlClockStatus { color: %1;"
-				" background: transparent; border: none; }")
-				.arg(PANEL_DIM));
+		(*status)->setStyleSheet(statusStyle(PANEL_DIM));
 
 		box->addWidget(*caption);
 		box->addWidget(*digits);
@@ -652,7 +652,8 @@ private:
 		 * appearing in Error moved the whole right-hand side of the
 		 * table. A readout that jitters as it updates is harder to read
 		 * than one that is a few pixels wider than it needs to be. */
-		auto fix = [&](int column, int chars) {
+		auto fix = [&](int column, int chars,
+			       int padding = CELL_PADDING_PX) {
 			const QFontMetrics values(fixedFont(this));
 			const QFontMetrics header(
 				table->horizontalHeader()->font());
@@ -666,7 +667,7 @@ private:
 				     title ? header.horizontalAdvance(
 						     title->text())
 					   : 0) +
-				CELL_PADDING_PX;
+				padding;
 			table->horizontalHeader()->setSectionResizeMode(
 				column, QHeaderView::Fixed);
 			table->setColumnWidth(column, width);
@@ -675,7 +676,10 @@ private:
 		fix(COL_TIMECODE, TC_CHARS);
 		fix(COL_LATENCY, VALUE_CHARS);
 		fix(COL_ADDED, VALUE_CHARS);
-		fix(COL_DRIFT, VALUE_CHARS);
+		/* Drift is the narrowest thing here — a value in milliseconds
+		 * almost always — so it gets half the slack the others do
+		 * rather than sitting in a column sized for its title. */
+		fix(COL_DRIFT, VALUE_CHARS, CELL_PADDING_PX / 2);
 
 		/* Status is prose rather than a figure, so it is sized from the
 		 * longest wording instead of a character count, and left
@@ -814,33 +818,37 @@ private:
 					  .toString(fmt);
 		}
 
-		const QString style =
-			digitStyle(live ? PANEL_LIVE : PANEL_DEAD);
-
 		clockLabel->setText(now);
-		clockLabel->setStyleSheet(style);
+		clockLabel->setStyleSheet(
+			digitStyle(live ? PANEL_LIVE : PANEL_DEAD));
+
+		/* The reference clock is live whenever there is a reference,
+		 * but nothing is being delayed unless sync is on, so this face
+		 * goes grey with the master switch rather than reading as a
+		 * time something is actually being shown at. */
 		showingLabel->setText(showing);
-		showingLabel->setStyleSheet(style);
+		showingLabel->setStyleSheet(digitStyle(
+			live && cfg.enabled ? PANEL_LIVE : PANEL_DEAD));
 
 		offsetBadge->setText(
 			QString("−%1").arg(format_ms(cfg.offset_ms)));
 
 		if (live) {
 			showingCaption->setText(
-				status_dot(PANEL_WARN) +
 				QStringLiteral("showing · delayed feed"));
+			showingCaption->setStyleSheet(statusStyle(PANEL_DIM));
 		} else {
 			/* Not being synced is only a problem if sync is meant
 			 * to be running. Polling is gated on the master switch,
 			 * so before it is on there is nothing wrong to report. */
 			showingCaption->setText(
 				cfg.enabled
-					? status_dot(PANEL_FAULT) +
-						  QStringLiteral(
-							  "no clock reference — sync cannot run")
-					: status_dot(PANEL_DEAD) +
-						  QStringLiteral(
-							  "turn sync on to start the clock"));
+					? QStringLiteral(
+						  "no clock reference — sync cannot run")
+					: QStringLiteral(
+						  "turn sync on to start the clock"));
+			showingCaption->setStyleSheet(statusStyle(
+				cfg.enabled ? PANEL_FAULT : PANEL_DIM));
 		}
 
 		/* An unreachable server keeps the last offset ticking along
@@ -866,25 +874,24 @@ private:
 
 		serverCaption->setText(
 			ntp.server[0]
-				? QString("<span style='color:%1;'>🌐 %2</span>"
+				? QString("<span style='color:%1;'>%2</span>"
 					  "<span style='color:%3;'> · UTC</span>")
 					  .arg(PANEL_LIVE,
 					       QString::fromUtf8(ntp.server)
 						       .toUpper(),
 					       PANEL_LIVE_DIM)
-				: QString("<span style='color:%1;'>🌐 NO SERVER</span>")
+				: QString("<span style='color:%1;'>NO SERVER</span>")
 					  .arg(PANEL_DEAD));
 
 		offsetCaption->setText(
-			QString("<span style='color:%1;'>↺ OFFSET</span>")
+			QString("<span style='color:%1;'>OFFSET</span>")
 				.arg(PANEL_DIM));
 
 		/* The server itself is the caption above the digits now, so
 		 * this line carries only how healthy it is. */
-		ntpLabel->setText(status_dot(fault ? PANEL_FAULT
-						   : live ? PANEL_LIVE
-							  : PANEL_DEAD) +
-				  health);
+		ntpLabel->setText(health);
+		ntpLabel->setStyleSheet(statusStyle(fault ? PANEL_FAULT
+							  : PANEL_DIM));
 	}
 
 	void updateApplyButton()
@@ -938,8 +945,11 @@ private:
 				->setText(QString::fromUtf8(e.source_name));
 			cell(row, COL_TIMECODE)->setText(format_timecode(s));
 
-			const bool measured = s.have_timecode &&
-					      s.status != IRL_SYNC_OFF;
+			/* Both of these describe what is arriving, not what
+			 * sync is doing with it, so they stay on display while
+			 * sync is off. Only the two columns that report the
+			 * controller's own work go blank. */
+			const bool measured = s.have_timecode;
 			const bool aligning = s.status == IRL_SYNC_LOCKED ||
 					      s.status == IRL_SYNC_ACQUIRING;
 			cell(row, COL_LATENCY)
