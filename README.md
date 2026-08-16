@@ -75,18 +75,18 @@ A source you just added sizes itself to the canvas when its first frame arrives,
 
 ### Settings
 
-| Setting | Default | What it does                                                                                                                                                                              |
-|---|---|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| URL | | Your pull URL. SRT, RTMP, or anything else FFmpeg can open                                                                                                                                |
-| Reconnect Delay | 2s | How long to wait between reconnect attempts                                                                                                                                               |
-| Target Buffer | 120ms | How much audio cushion to hold. This is your main latency knob: higher rides out a worse connection, lower is snappier and less forgiving                                                 |
-| Adaptive Latency Control | On | Holds latency near your target by nudging playback speed (up to 2% slow, 5% fast) instead of dropping audio                                                                               |
-| FFmpeg Options | | Extra options for the stream reader, `key1=val1 key2=val2` style. Use this to set the SRT `latency`, for example                                                                          |
-| Hardware Decode | Auto | Let the GPU decode video. Auto picks whatever your machine supports, Off forces the CPU                                                                                                   |
-| Wait for Keyframe | On | Hold video back until a clean frame arrives, so you never see blocky garbage on join                                                                                                      |
-| Low Latency Audio | Off | Play audio the moment it arrives, with no cushion. Lowest delay, least tolerant of a wobbly connection                                                                                    |
-| Show Nothing When the Stream Ends | On | Blank the source as soon as the stream drops, instead of leaving the last frame frozen on screen until it reconnects. Same idea as the media source's "Show nothing when playback ends"   |
-| Sync | Off | Include this source in the RTC Timecode Sync feature. See [`src/sync/`](src/sync/) for more info.                                                                                         |
+| Setting | Default | What it does |
+|---|---|---|
+| URL | | Your pull URL. SRT, RTMP, or anything else FFmpeg can open |
+| Reconnect Delay | 2s | How long to wait between reconnect attempts |
+| Target Buffer | 120ms | How much audio cushion to hold. This is your main latency knob: higher rides out a worse connection, lower is snappier and less forgiving |
+| Adaptive Latency Control | On | Holds latency near your target by nudging playback speed (up to 2% slow, 5% fast) instead of dropping audio |
+| FFmpeg Options | | Extra options for the stream reader, `key1=val1 key2=val2` style. Use this to set the SRT `latency`, for example |
+| Hardware Decode | Auto | Let the GPU decode video. Auto picks whatever your machine supports, Off forces the CPU |
+| Wait for Keyframe | On | Hold video back until a clean frame arrives, so you never see blocky garbage on join |
+| Low Latency Audio | Off | Play audio the moment it arrives, with no cushion. Lowest delay, least tolerant of a wobbly connection |
+| Show Nothing When the Stream Ends | On | Blank the source as soon as the stream drops, instead of leaving the last frame frozen on screen until it reconnects. Same idea as the media source's "Show nothing when playback ends" |
+| Sync | Off | Include this source in the RTC Timecode Sync feature. See [`src/sync/`](src/sync/) for more info. |
 | Close Stream When Inactive | Off | Stop pulling the stream when the source is neither showing nor active (the last frame goes black if Show Nothing When the Stream Ends is on), and reconnect when it becomes visible again |
 
 Target Buffer, Reconnect Delay, Adaptive Latency Control, Wait for Keyframe, Show Nothing When the Stream Ends and Close Stream When Inactive can be changed while the stream is running. The connection stays up and the stats counters keep counting. The one exception is turning Close Stream When Inactive on while the source is already hidden, which is a request to stop receiving: that drops the connection and resets the stats counters, as it would on any later hide. Changing Target Buffer mid-stream keeps every buffered sample and walks the latency to the new value at up to +5% or -2% speed, so you should not hear a seam. Changing URL, FFmpeg Options, Hardware Decode or Low Latency Audio reconnects, because those are set when the stream is opened.
