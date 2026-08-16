@@ -557,6 +557,14 @@ struct irl_source {
 	uint64_t sync_error_time[IRL_SYNC_ERROR_SAMPLES];
 	int sync_error_head;
 	int sync_error_count;
+	/* Where content has to play for the stream to land on its offset,
+	 * expressed as the audio playout offset it implies: obs_ts - pts. The
+	 * audio thread reads it once, when it primes, to anchor its output
+	 * clock; the receiver thread keeps it current. Guarded by
+	 * audio_state_lock, like the rest of the cross-thread timing state.
+	 * See irl_sync_playout_anchor(). */
+	int64_t sync_present_bias_ns;
+	bool sync_present_bias_valid;
 	/* Cleared at engage, set when the first correction after it is made,
 	 * so how far the seed missed is logged once rather than every packet.
 	 * See SYNC_SEED_BIAS_NS. */

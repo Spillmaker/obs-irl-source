@@ -790,11 +790,38 @@ bool irl_pump_audio_once(struct irl_source *ctx)
 			return false;
 
 		ctx->audio_out_primed = true;
-		ctx->audio_out_anchor_ns = now + chunk_ns;
 		ctx->audio_out_samples = 0;
-		blog(LOG_INFO,
-		     "[irl-source] Audio output primed (fill=%dms lead=%dms rate=%d)",
-		     fill_ms, (int)(lead_ns / 1000000ULL), out_rate);
+
+		/* Anchor the output clock where the timecodes say this audio
+		 * belongs, rather than at "now".
+		 *
+		 * This is the one instant the stream can be placed exactly and
+		 * for free: nothing is playing yet, so starting later costs
+		 * only pre-roll. Anchoring at "now" and letting the sync loop
+		 * correct afterwards means moving a pipeline that is already
+		 * running, which it can only do through the speed controller's
+		 * -2%/+5% — twenty seconds for the few hundred milliseconds the
+		 * seed typically misses by, with an underrun each time the hold
+		 * grows to do it.
+		 *
+		 * Falls back to the old behaviour whenever sync has nothing to
+		 * say: sync off, no timecodes, no NTP reference, or a placement
+		 * already in the past, which anchoring cannot reach. */
+		uint64_t anchor_ns = now + chunk_ns;
+		const bool placed =
+			irl_sync_playout_anchor(ctx, peek, now, &anchor_ns);
+		ctx->audio_out_anchor_ns = anchor_ns;
+
+		if (placed)
+			blog(LOG_INFO,
+			     "[irl-source] Audio output primed (fill=%dms lead=%dms rate=%d), placed by sync %llums ahead",
+			     fill_ms, (int)(lead_ns / 1000000ULL), out_rate,
+			     (unsigned long long)((anchor_ns - now) /
+						  1000000ULL));
+		else
+			blog(LOG_INFO,
+			     "[irl-source] Audio output primed (fill=%dms lead=%dms rate=%d)",
+			     fill_ms, (int)(lead_ns / 1000000ULL), out_rate);
 	}
 
 	if (!has_audio) {

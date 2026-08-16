@@ -79,19 +79,24 @@
 
 /* Deliberate over-hold at engage.
  *
- * The seed can only estimate this machine's pipeline, and whatever it misses
- * by is what the loop then grinds off. Which side it misses on decides how
- * long that takes, because the two directions are not the same speed: a source
- * that started too late is pulled in by draining the jitter buffer, which the
- * speed controller does at +5%, and one that started too early has to be
- * pushed back by rebuilding that buffer at -2%. Same error, two and a half
- * times the wait — and the slow direction is the one the seed was landing on.
+ * The seed can only estimate this machine's pipeline, and it lands early —
+ * roughly half a second, most of it the startup backlog trim, which discards
+ * audio after sync has already chosen its hold. That is the harmless
+ * direction, because irl_sync_playout_anchor() places the output clock exactly
+ * when it primes and early simply means the anchor waits. Late it cannot fix:
+ * a placement in the past can only be reached by discarding audio.
  *
- * So the seed is deliberately generous, and the ceiling below makes room for
- * exactly this much overshoot rather than clamping it straight back off. The
- * cost of overshooting is paid at the fast rate; the cost of undershooting is
- * paid at the slow one, so the two are not worth balancing. */
+ * So this is not here to make the seed accurate. It is here to bound the wait,
+ * and with it the pre-roll that builds up in the jitter buffer while the
+ * anchor is pending. The ceiling below makes room for it rather than clamping
+ * it back off in the same call that set it. */
 #define SYNC_SEED_BIAS_NS 250000000LL
+
+/* Longest pre-roll irl_sync_playout_anchor() will ask the audio output to wait
+ * before it starts. Past this the seed is wrong by more than the jitter buffer
+ * should be asked to hold, and starting at "now" and correcting is the lesser
+ * evil. */
+#define SYNC_ANCHOR_MAX_WAIT_NS 1500000000LL
 
 /* Longest the audio output is kept from priming while sync works out its hold.
  *
@@ -615,6 +620,11 @@ void irl_sync_reset(struct irl_source *ctx)
 {
 	delay_clear(&ctx->sync_delay);
 
+	irl_mutex_lock(&ctx->audio_state_lock);
+	ctx->sync_present_bias_ns = 0;
+	ctx->sync_present_bias_valid = false;
+	irl_mutex_unlock(&ctx->audio_state_lock);
+
 	ctx->sync_engaged = false;
 	ctx->sync_seed_reported = false;
 	ctx->sync_status = IRL_SYNC_OFF;
@@ -874,18 +884,43 @@ static void observe_timecode(struct irl_source *ctx, const AVPacket *pkt,
 	}
 
 	int64_t pts_ns = 0;
+	bool have_pts = false;
 	if (pkt->pts != AV_NOPTS_VALUE && ctx->fmt_ctx &&
 	    ctx->video_stream_idx >= 0) {
 		AVStream *vs = ctx->fmt_ctx->streams[ctx->video_stream_idx];
 		pts_ns = av_rescale_q(pkt->pts, vs->time_base,
 				      (AVRational){1, 1000000000});
+		have_pts = true;
+	}
+
+	/* Where this content should land, in the OBS clock. `now_ns` cancels
+	 * out of it — target = now + offset - (now - capture) = capture +
+	 * offset — so this carries no arrival jitter, only the frame the
+	 * timecode was quantised to. */
+	const int64_t target_ns = (int64_t)now_ns + needed_ns;
+
+	/* Publish it as the playout offset it implies, for the audio output to
+	 * anchor on when it primes. Smoothed, because a single reading inherits
+	 * the timecode's one-frame grid — 33ms at 30fps, most of the lock
+	 * tolerance — and the anchor is a one-shot placement with no second
+	 * chance. Eight samples is a third of a second at 30fps and averages
+	 * that grid away without lagging an offset change the loop below would
+	 * have to unpick. */
+	if (have_pts) {
+		const int64_t raw_ns = target_ns - pts_ns;
+		irl_mutex_lock(&ctx->audio_state_lock);
+		ctx->sync_present_bias_ns =
+			ctx->sync_present_bias_valid
+				? ctx->sync_present_bias_ns +
+					  (raw_ns - ctx->sync_present_bias_ns) / 8
+				: raw_ns;
+		ctx->sync_present_bias_valid = true;
+		irl_mutex_unlock(&ctx->audio_state_lock);
 	}
 
 	int64_t presentation_ns;
-	if (pkt->pts != AV_NOPTS_VALUE &&
+	if (have_pts &&
 	    predict_presentation_ns(ctx, pts_ns, &presentation_ns)) {
-		/* Where this content should land, and where it will. */
-		int64_t target_ns = (int64_t)now_ns + needed_ns;
 		ctx->sync_error_ns = error_filter_push(
 			ctx, presentation_ns - target_ns, now_ns);
 
@@ -1021,6 +1056,31 @@ static void update_prime_gate(struct irl_source *ctx, uint64_t now_ns)
 bool irl_sync_prime_held(struct irl_source *ctx)
 {
 	return os_atomic_load_bool(&ctx->sync_prime_hold);
+}
+
+bool irl_sync_playout_anchor(struct irl_source *ctx, int64_t pts_ns,
+			     uint64_t now_ns, uint64_t *anchor_ns)
+{
+	if (pts_ns <= 0)
+		return false;
+
+	irl_mutex_lock(&ctx->audio_state_lock);
+	const bool valid = ctx->sync_present_bias_valid;
+	const int64_t bias_ns = ctx->sync_present_bias_ns;
+	irl_mutex_unlock(&ctx->audio_state_lock);
+
+	if (!valid)
+		return false;
+
+	/* The playout offset the loop spends its life steering toward, applied
+	 * here in one step because nothing is playing yet to disturb. */
+	const int64_t placed_ns = pts_ns + bias_ns;
+	const int64_t wait_ns = placed_ns - (int64_t)now_ns;
+	if (wait_ns <= 0 || wait_ns > SYNC_ANCHOR_MAX_WAIT_NS)
+		return false;
+
+	*anchor_ns = (uint64_t)placed_ns;
+	return true;
 }
 
 void irl_sync_observe(struct irl_source *ctx, const AVPacket *pkt)
