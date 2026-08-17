@@ -35,7 +35,7 @@ void irl_source_get_defaults(obs_data_t *settings)
 				  IRL_DEFAULT_CLOSE_WHEN_INACTIVE);
 	obs_data_set_default_bool(settings, "clear_on_disconnect",
 				  IRL_DEFAULT_CLEAR_ON_DISCONNECT);
-	/* ── timecode sync ── */
+	/* IRLSync */
 	irl_sync_source_defaults(settings);
 }
 
@@ -78,7 +78,7 @@ obs_properties_t *irl_source_get_properties(void *data)
 			"make silence or hitches more likely on bad signal."),
 		OBS_TEXT_INFO);
 
-	/* ── timecode sync ── */
+	/* IrlSync */
 	irl_sync_source_properties(props);
 
 	/* ── Advanced ──────────────────────────────────────── */

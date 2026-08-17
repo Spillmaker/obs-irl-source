@@ -26,6 +26,5 @@ void irl_video_request_clear(struct irl_source *ctx);
 void *irl_video_thread(void *data);
 void irl_log_receiver_stats(struct irl_source *ctx);
 
-/* Route one packet to its decoder. Shared by the read loop and the sync
- * delay line, which releases held packets down the same path. */
+/* IRLSync */
 void irl_dispatch_packet(struct irl_source *ctx, AVPacket *pkt, AVFrame *frame);

@@ -585,7 +585,8 @@ static bool emit_concealment_silence(struct irl_source *ctx, int frames)
 
 /* ── Offset re-anchor ─────────────────────────────────────── */
 
-/* Where a fresh output clock should start.
+/* IRLSync
+ * Where a fresh output clock should start.
  *
  * Every restart of the clock line goes through this, not just the first one at
  * prime. A restart that anchors at "now" throws away the placement sync made,
@@ -593,23 +594,31 @@ static bool emit_concealment_silence(struct irl_source *ctx, int frames)
  * second — so a single outage would cost the alignment on top of the audio.
  * Re-placing costs nothing extra, because the clock is being moved either way.
  *
- * Falls back to "now" when sync has nothing to say, which is also what happens
- * when the placement is already in the past: a clock cannot start behind
- * itself, and the loop is the right tool for that case.
+ * Returns "now + chunk_ns" — what the plugin does without sync — whenever sync
+ * has nothing to say: sync off, no timecodes, no NTP reference, or a placement
+ * already in the past, which a clock cannot start behind. So a source with sync
+ * off gets master's behaviour, and the callers need no branch of their own.
  *
- * Must not be called with audio_state_lock held — irl_sync_playout_anchor()
- * takes it. */
-static uint64_t audio_fresh_anchor_ns(struct irl_source *ctx, int64_t peek_ns,
-				      uint64_t now, uint64_t chunk_ns,
-				      bool *placed)
+ * The placement is reported here rather than folded into the caller's log line,
+ * so the plugin's own messages read the same with sync on or off.
+ *
+ * Must not be called with audio_state_lock held: the peek takes the buffer
+ * mutex and irl_sync_playout_anchor() takes the state lock. */
+static uint64_t audio_fresh_anchor_ns(struct irl_source *ctx, uint64_t now,
+				      uint64_t chunk_ns)
 {
-	uint64_t anchor_ns = now + chunk_ns;
-	/* ── timecode sync ── */
-	const bool ok =
-		irl_sync_playout_anchor(ctx, peek_ns, now, &anchor_ns);
+	const uint64_t fallback_ns = now + chunk_ns;
+	uint64_t anchor_ns = fallback_ns;
+	int64_t peek_ns = 0;
 
-	if (placed)
-		*placed = ok;
+	if (!audio_buffer_peek_state(&ctx->audio_buf, &peek_ns, NULL, NULL))
+		return fallback_ns;
+	if (!irl_sync_playout_anchor(ctx, peek_ns, now, &anchor_ns))
+		return fallback_ns;
+
+	blog(LOG_INFO,
+	     "[irl-source] IRLSync placed the audio output clock %llums ahead of now",
+	     (unsigned long long)((anchor_ns - now) / 1000000ULL));
 	return anchor_ns;
 }
 
@@ -665,17 +674,10 @@ static void irl_audio_maybe_reanchor_offset(struct irl_source *ctx,
 	    ctx->audio_buf.target_ms)
 		return;
 
-	/* Both of these take the buffer mutex or the state lock on their own,
-	 * so they happen before the state lock is taken below rather than
-	 * inside it. Lock order note: the fill query above does the same. */
-	int64_t peek_ns = 0;
-	int peek_fill_ms = 0;
-	int peek_chunks = 0;
-	audio_buffer_peek_state(&ctx->audio_buf, &peek_ns, &peek_fill_ms,
-				&peek_chunks);
-	bool placed = false;
-	const uint64_t anchor_ns =
-		audio_fresh_anchor_ns(ctx, peek_ns, now, chunk_ns, &placed);
+	/* Lock order note: fill query above takes and releases the buffer
+	 * mutex on its own; the state lock below is never held across it. */
+	/* IRLSync */
+	const uint64_t anchor_ns = audio_fresh_anchor_ns(ctx, now, chunk_ns);
 
 	irl_mutex_lock(&ctx->audio_state_lock);
 	ctx->audio_out_anchor_ns = anchor_ns;
@@ -689,10 +691,9 @@ static void irl_audio_maybe_reanchor_offset(struct irl_source *ctx,
 	ctx->audio_offset_reanchors++;
 	ctx->audio_quality_events++;
 	blog(LOG_WARNING,
-	     "[irl-source] Audio latency drifted +%lldms past baseline (>%dms) with buffer at/below target; re-anchoring output clock%s",
+	     "[irl-source] Audio latency drifted +%lldms past baseline (>%dms) with buffer at/below target; re-anchoring output clock",
 	     (long long)(excess_ns / 1000000LL),
-	     AUDIO_OFFSET_REANCHOR_MARGIN_MS,
-	     placed ? " (re-placed by sync)" : "");
+	     AUDIO_OFFSET_REANCHOR_MARGIN_MS);
 }
 
 /* ── Unwinnable drain detection ───────────────────────────── */
@@ -781,24 +782,16 @@ bool irl_pump_audio_once(struct irl_source *ctx)
 		 * permanent audio buffering for a late source. */
 		if (now > next_ts &&
 		    now - next_ts > AUDIO_OUT_MAX_LAG_MS * 1000000ULL) {
-			int64_t stall_peek_ns = 0;
-			int stall_fill_ms = 0;
-			int stall_chunks = 0;
-			audio_buffer_peek_state(&ctx->audio_buf,
-						&stall_peek_ns, &stall_fill_ms,
-						&stall_chunks);
-			bool placed = false;
-
 			ctx->audio_output_restarts++;
 			ctx->audio_quality_events++;
-			ctx->audio_out_anchor_ns = audio_fresh_anchor_ns(
-				ctx, stall_peek_ns, now, chunk_ns, &placed);
+			blog(LOG_WARNING,
+			     "[irl-source] Audio output stalled %llums; restarting output clock",
+			     (unsigned long long)((now - next_ts) / 1000000ULL));
+			/* IRLSync */
+			ctx->audio_out_anchor_ns =
+				audio_fresh_anchor_ns(ctx, now, chunk_ns);
 			ctx->audio_out_samples = 0;
 			ctx->audio_conceal_fade_pending = true;
-			blog(LOG_WARNING,
-			     "[irl-source] Audio output stalled %llums; restarting output clock%s",
-			     (unsigned long long)((now - next_ts) / 1000000ULL),
-			     placed ? " (re-placed by sync)" : "");
 		}
 	}
 
@@ -840,39 +833,17 @@ bool irl_pump_audio_once(struct irl_source *ctx)
 			return false;
 
 		ctx->audio_out_primed = true;
+		/* IRLSync
+		 * The one instant a stream can be placed exactly and for free:
+		 * nothing is playing yet, so starting later costs only
+		 * pre-roll. Correcting afterwards means moving a running
+		 * pipeline, which only the speed controller can do. */
+		ctx->audio_out_anchor_ns =
+			audio_fresh_anchor_ns(ctx, now, chunk_ns);
 		ctx->audio_out_samples = 0;
-
-		/* Anchor the output clock where the timecodes say this audio
-		 * belongs, rather than at "now".
-		 *
-		 * This is the one instant the stream can be placed exactly and
-		 * for free: nothing is playing yet, so starting later costs
-		 * only pre-roll. Anchoring at "now" and letting the sync loop
-		 * correct afterwards means moving a pipeline that is already
-		 * running, which it can only do through the speed controller's
-		 * -2%/+5% — twenty seconds for the few hundred milliseconds the
-		 * seed typically misses by, with an underrun each time the hold
-		 * grows to do it.
-		 *
-		 * Falls back to the old behaviour whenever sync has nothing to
-		 * say: sync off, no timecodes, no NTP reference, or a placement
-		 * already in the past, which anchoring cannot reach. */
-		bool placed = false;
-		const uint64_t anchor_ns =
-			audio_fresh_anchor_ns(ctx, peek, now, chunk_ns,
-					      &placed);
-		ctx->audio_out_anchor_ns = anchor_ns;
-
-		if (placed)
-			blog(LOG_INFO,
-			     "[irl-source] Audio output primed (fill=%dms lead=%dms rate=%d), placed by sync %llums ahead",
-			     fill_ms, (int)(lead_ns / 1000000ULL), out_rate,
-			     (unsigned long long)((anchor_ns - now) /
-						  1000000ULL));
-		else
-			blog(LOG_INFO,
-			     "[irl-source] Audio output primed (fill=%dms lead=%dms rate=%d)",
-			     fill_ms, (int)(lead_ns / 1000000ULL), out_rate);
+		blog(LOG_INFO,
+		     "[irl-source] Audio output primed (fill=%dms lead=%dms rate=%d)",
+		     fill_ms, (int)(lead_ns / 1000000ULL), out_rate);
 	}
 
 	if (!has_audio) {

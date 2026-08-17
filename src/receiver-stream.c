@@ -383,10 +383,8 @@ bool irl_open_stream(struct irl_source *ctx)
 void irl_prepare_new_connection(struct irl_source *ctx)
 {
 	os_atomic_store_bool(&ctx->reconnecting, false);
-	/* Held packets carry the old connection's PTS epoch, and the sync
-	 * controller's hold was measured against a pipeline that no longer
-	 * exists. Both have to start over with the new stream. */
-	/* ── timecode sync ── */
+	/* IRLSync
+	 * Resets the metadata since we are getting a new feed. */
 	irl_sync_reset(ctx);
 	ctx->first_keyframe_received = false;
 	ctx->video_pkt_gate_open = false;
@@ -471,14 +469,9 @@ void irl_handle_stream_read_error(struct irl_source *ctx, int read_ret)
 	irl_close_ffmpeg(ctx);
 	pts_repair_reset(&ctx->pts_state);
 	/* ── timecode sync ── */
-	/* Here rather than only in irl_prepare_new_connection, which does not
-	 * run until the reconnect delay has elapsed. The controller is driven
-	 * by arriving packets, so once they stop nothing updates or republishes
-	 * the status and the dock keeps showing whatever the source was doing
-	 * when the feed died — a blinking "No data" alarm on a source that is
-	 * simply not connected. Resetting here publishes Off straight away, and
-	 * leaves "No data" to mean what it says: a stream that is up and has
-	 * stopped stamping timecodes. */
+	/* IRLSync
+	 * Resets the metadata on any feed errors as to prevent cascading issues.
+	 */
 	irl_sync_reset(ctx);
 
 	/* Blank the source instead of leaving the last decoded frame frozen
