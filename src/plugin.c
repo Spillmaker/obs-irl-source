@@ -10,6 +10,7 @@
 
 #include <obs-module.h>
 #include "../include/irl-source.h"
+/* IRLSync */
 #include "../include/sync/irl-sync.h"
 
 OBS_DECLARE_MODULE()
@@ -40,8 +41,7 @@ static struct obs_source_info irl_source_info = {
 bool obs_module_load(void)
 {
 	obs_register_source(&irl_source_info);
-
-	/* ── timecode sync ── */
+	/* IRLSync */
 	irl_sync_module_load();
 	return true;
 }
@@ -53,7 +53,7 @@ bool obs_module_load(void)
 void obs_module_post_load(void)
 {
 	irl_websocket_vendor_register();
-	/* ── timecode sync ── */
+	/* IRLSync */
 	irl_sync_module_post_load();
 }
 
@@ -70,6 +70,6 @@ const char *obs_module_author(void)
 
 void obs_module_unload(void)
 {
-	/* ── timecode sync ── */
+	/* IRLSync */
 	irl_sync_module_unload();
 }
