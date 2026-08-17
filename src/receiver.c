@@ -102,7 +102,7 @@ void *irl_receiver_thread(void *data)
 				break;
 		}
 
-		/* ── timecode sync ── */
+		/* IRLSync */
 		if (!irl_sync_wait_for_room(ctx, frame))
 			break;
 
@@ -113,13 +113,15 @@ void *irl_receiver_thread(void *data)
 			continue;
 		}
 
-		/* ── timecode sync ── */
+		/* IRLSync */
 		if (!irl_sync_intercept(ctx, pkt))
 			irl_dispatch_packet(ctx, pkt, frame);
 
 		av_packet_unref(pkt);
-		/* ── timecode sync ── */
+
+		/* IRLSync */
 		irl_sync_drain(ctx, frame);
+
 		irl_log_receiver_stats(ctx);
 	}
 
