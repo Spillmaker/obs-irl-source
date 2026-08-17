@@ -8,7 +8,6 @@
  * irl-source.c — Source lifecycle: create, destroy, update, tick
  */
 
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -132,7 +131,7 @@ static void config_apply_hot(struct irl_source *ctx,
 			     next->clear_on_disconnect);
 	/* IRLSync */
 	os_atomic_store_bool(&ctx->config.sync_enabled,
-				 next->sync_enabled);
+			     next->sync_enabled);
 
 	ctx->config.close_when_inactive = next->close_when_inactive;
 
