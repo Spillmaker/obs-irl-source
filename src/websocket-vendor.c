@@ -26,21 +26,20 @@
  */
 
 #include <assert.h>
-#include <stdio.h>
 #include <string.h>
 
 #include <obs-module.h>
 
 #include "../include/irl-source.h"
-#include "../include/sync/irl-sync.h"
 #include "../third_party/obs-websocket-api.h"
+#include "../include/sync/irl-sync.h"
 
 #define IRL_VENDOR_NAME "obs-irl-source"
 
 /* Bumped when a request is added or a response field changes meaning, so a
  * client can feature-detect instead of probing.
  *
- * 2: adds GetSyncStatus and the sync_* fields on GetStats. */
+ * 2: Initial addition of the IRLSync commands */
 #define IRL_VENDOR_API_VERSION 2
 
 #define IRL_ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
@@ -92,7 +91,7 @@ static const struct irl_stat_field irl_stat_fields[] = {
 	{"stream_delay_ms", IRL_STAT_INT},
 	{"low_latency_audio", IRL_STAT_BOOL},
 	{"reconnect_count", IRL_STAT_INT},
-	/* ── timecode sync ── */
+	/* ── IRLSync ── */
 	IRL_SYNC_STAT_FIELDS
 };
 
@@ -312,7 +311,7 @@ static const struct {
 } irl_vendor_requests[] = {
 	{"GetStats", vendor_get_stats},
 	{"GetSourceList", vendor_get_source_list},
-	/* ── timecode sync ── */
+	/* ── IRLSync ── */
 	{"GetSyncStatus", irl_sync_vendor_status},
 	{"GetVersion", vendor_get_version},
 };
