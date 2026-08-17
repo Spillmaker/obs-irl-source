@@ -65,7 +65,9 @@ static void config_load(struct irl_config *cfg, obs_data_t *settings)
 		obs_data_get_bool(settings, "close_when_inactive");
 	cfg->clear_on_disconnect =
 		obs_data_get_bool(settings, "clear_on_disconnect");
-	cfg->sync_enabled = obs_data_get_bool(settings, "sync_enabled");
+	/* IRLSync */
+	cfg->sync_enabled =
+		obs_data_get_bool(settings, "sync_enabled");
 }
 
 static bool str_differs(const char *a, const char *b)
@@ -128,7 +130,10 @@ static void config_apply_hot(struct irl_source *ctx,
 			     next->wait_for_keyframe);
 	os_atomic_store_bool(&ctx->config.clear_on_disconnect,
 			     next->clear_on_disconnect);
-	os_atomic_store_bool(&ctx->config.sync_enabled, next->sync_enabled);
+	/* IRLSync */
+	os_atomic_store_bool(&ctx->config.sync_enabled,
+				 next->sync_enabled);
+
 	ctx->config.close_when_inactive = next->close_when_inactive;
 
 	irl_mutex_unlock(&ctx->audio_state_lock);
@@ -205,9 +210,8 @@ static void reset_runtime_state(struct irl_source *ctx)
 	 * the video thread never got to is correct: the stop path decides for
 	 * itself whether the frame stays. */
 	ctx->video_clear_pending = false;
-	/* Safe without the receiver thread's usual ownership for the same
-	 * reason as video_clear_pending above: the workers are stopped here. */
-	/* ── timecode sync ── */
+	/* IRLSync
+	 * Resets the previously acquired values related to IRLSync for this source. */
 	irl_sync_reset(ctx);
 	os_atomic_store_bool(&ctx->reconnecting, false);
 	irl_mutex_lock(&ctx->audio_state_lock);
@@ -395,7 +399,7 @@ static void irl_source_get_stats(void *data, calldata_t *cd)
 			  ctx->config.low_latency_audio);
 	calldata_set_int(cd, "reconnect_count", (long long)reconnect_count);
 
-	/* ── timecode sync ── */
+	/* IRLSync */
 	irl_sync_stats(ctx, cd);
 }
 
@@ -447,11 +451,11 @@ void *irl_source_create(obs_data_t *settings, obs_source_t *source)
 		"out int video_lead_ms, out int video_lead_excess, "
 		"out int stream_delay_ms, out bool low_latency_audio, "
 		"out int reconnect_count, "
-		/* ── timecode sync ── */
+		/* IRLSync */
 		IRL_SYNC_STATS_PROC_DECL ")",
 		irl_source_get_stats, ctx);
 
-	/* ── timecode sync ── */
+	/* IRLSync */
 	irl_sync_register_source(ctx);
 
 	if (ctx->config.url) {
@@ -471,14 +475,12 @@ void irl_source_destroy(void *data)
 	if (!ctx)
 		return;
 
-	/* Before anything else: the registry is what the dock and the vendor
-	 * enumerate, and irl_sync_collect() reads ctx->source under its lock. */
-	/* ── timecode sync ── */
-	irl_sync_unregister_source(ctx);
-
 	stop_receiver(ctx, false);
-	/* ── timecode sync ── */
+
+	/* IRLSync */
+	irl_sync_unregister_source(ctx); /* Has to happen before irl_sync_free */
 	irl_sync_free(ctx);
+
 	audio_buffer_free(&ctx->audio_buf);
 	irl_mutex_destroy(&ctx->audio_state_lock);
 	irl_cond_destroy(&ctx->video_queue_cond);
