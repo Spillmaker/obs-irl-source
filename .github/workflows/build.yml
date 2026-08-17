@@ -12,6 +12,8 @@ on:
 # building against the OLDEST supported line produces one artifact that loads
 # on that line and every newer one. That is why there is no per-OBS-line matrix
 # here any more.
+
+# QT6 is added as a dependency due to the Sync-feature having a dock (User interface)
 env:
   OBS_VERSION: "32.1.2"
   OBS_DEPS_VERSION: "2025-08-23"
