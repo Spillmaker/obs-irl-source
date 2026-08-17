@@ -397,7 +397,6 @@ static void irl_source_get_stats(void *data, calldata_t *cd)
 	calldata_set_bool(cd, "low_latency_audio",
 			  ctx->config.low_latency_audio);
 	calldata_set_int(cd, "reconnect_count", (long long)reconnect_count);
-
 	/* IRLSync */
 	irl_sync_stats(ctx, cd);
 }
@@ -453,7 +452,6 @@ void *irl_source_create(obs_data_t *settings, obs_source_t *source)
 		/* IRLSync */
 		IRL_SYNC_STATS_PROC_DECL ")",
 		irl_source_get_stats, ctx);
-
 	/* IRLSync */
 	irl_sync_register_source(ctx);
 
@@ -475,7 +473,6 @@ void irl_source_destroy(void *data)
 		return;
 
 	stop_receiver(ctx, false);
-
 	/* IRLSync */
 	irl_sync_unregister_source(ctx); /* Has to happen before irl_sync_free */
 	irl_sync_free(ctx);
