@@ -36,11 +36,12 @@
 #include <libavutil/time.h>
 #include <libavutil/hwcontext.h>
 #include "audio-buffer.h"
-#include "sync/irl-sei.h"
-#include "sync/irl-sync-state.h"
-#include "sync/irl-sync.h"
 #include "irl-threading.h"
 #include "pts-repair.h"
+
+/* IRLSync */
+#include "sync/irl-sync-state.h"
+#include "sync/irl-sync.h"
 
 /* The source id registered with OBS. Also what the obs-websocket vendor
  * matches on to tell an IRL source from any other input. */
@@ -61,6 +62,7 @@ struct irl_source;
 #define IRL_DEFAULT_LOW_LATENCY_AUDIO false
 #define IRL_DEFAULT_CLOSE_WHEN_INACTIVE false
 #define IRL_DEFAULT_CLEAR_ON_DISCONNECT true
+/* IRLSync */
 #define IRL_DEFAULT_SYNC_ENABLED false
 
 /* Min/max buffer are derived from the target rather than exposed as
@@ -214,9 +216,11 @@ struct irl_config {
 	 * on; same meaning here, minus the local-file cases. */
 	volatile bool clear_on_disconnect; /* hot */
 
-	/* Per-source opt-in to timecode sync. The offset and the master
-	 * switch are global (see irl-sync.h); this only says whether this
-	 * source participates. Hot, so toggling it never drops the stream. */
+	/* Per-source opt-in toggle for the IRLSync feature.
+	 * Toggling this on adds the source to the list of sources that
+	 * will participate in the timecode synchronization that happens in a dedicated
+	 * dock.
+	 */
 	volatile bool sync_enabled; /* hot */
 };
 
@@ -501,12 +505,7 @@ struct irl_source {
 	 * thread only, like the callbacks that touch it. */
 	bool media_stopped;
 
-	/* ── Timecode sync ───────────────────────────────────
-	 *
-	 * Everything the feature needs on a source, in one member so it can be
-	 * read as one thing and skipped as one thing. Defined in
-	 * include/sync/irl-sync-state.h; nothing outside src/sync/ touches its
-	 * insides. */
+	/* IRLSync object that contains the IRLSync related values. */
 	struct irl_sync_state sync;
 
 	/* Statistics */
