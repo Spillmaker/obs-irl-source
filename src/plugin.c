@@ -49,7 +49,7 @@ bool obs_module_load(void)
 /* Runs after every module's obs_module_load(), which is the only point at
  * which obs-websocket is guaranteed to have published its API. See
  * websocket-vendor.c. We also load the IRLSync Dock here since this is the
- * step where we*/
+ * step where we know UI exists. */
 void obs_module_post_load(void)
 {
 	irl_websocket_vendor_register();
