@@ -109,8 +109,39 @@ reason.
 
 It polls from the moment the plugin loads, not from the moment sync is switched
 on, so the dock's clock is running before you commit to anything — which is what
-you read to decide whether sync is worth turning on at all. The cost is one
-request to the pool a minute for everyone with the plugin installed.
+you read to decide whether sync is worth turning on at all.
+
+### Which server you set changes how it polls
+
+How hard a client may poll is a property of the server, so the server name
+picks the policy.
+
+**A server run for this plugin** — today `ntp.kringkast.com`, which is the
+default — is there to be asked. The client sends four packets on arrival and keeps the one with the
+lowest round trip, then one packet every 1 to 30 seconds, at random. Random
+rather than fixed so that every OBS on the network does not poll in step.
+
+That sample rate is what pays for the second number on the clock line: the
+**ppm** figure is this machine's own crystal error, measured by fitting the
+last quarter hour of samples. A PC that runs 40 ppm fast loses 2.4ms of
+alignment every minute, which is a frame and a half at 60fps, and on this
+policy the client extrapolates that away between polls instead of waiting for
+the next packet to correct it.
+
+**A public pool** — `pool.ntp.org`, or any other host you type in — is donated
+capacity. There
+the client sends one packet per poll, every 64 seconds, doubles that interval
+if the server answers with a rate-limit kiss-o'-death, and stops polling
+altogether if it answers with a denial. The crystal error is still measured
+and shown, but it is not applied: one sample a minute is too sparse a fit to
+hand the timeline to.
+
+If the configured server stops answering, three failed polls in a row hand over
+to `pool.ntp.org` so the clock keeps running, and the clock line says
+`fallback` while the server name above it changes to the pool. The original is
+probed again every 30 to 60 seconds — randomised again, so that everyone
+knocked off by one outage does not all come back at the same instant — and the
+client returns to it on the first answer.
 
 The master switch, the offset and the NTP server are stored per machine (in the
 plugin's own config), not in the scene collection. A scene collection copied to
@@ -147,8 +178,11 @@ can actually fix an out-of-sync feed is the one out in the field — so a bot
 polling this can put "chase cam out of sync, needs 7.4s" in chat, where it will
 be seen. `out_of_sync_count` and `recommended_offset_ms` are pre-computed so a
 bot does not have to reimplement the policy. `clock` reports the NTP reference
-as `{synced, server, offset_ms, rtt_ms, age_ms, utc_ms}`; a large `age_ms` means
-the reference has gone stale and everything downstream of it is suspect. Each
+as `{synced, server, primary_server, offset_ms, rtt_ms, age_ms, utc_ms,
+burst_mode, fallback_active, drift_valid, drift_ppm}`; a large `age_ms` means
+the reference has gone stale and everything downstream of it is suspect, and
+`fallback_active` means `server` is the pool the client failed over to rather
+than the `primary_server` it was asked for. Each
 entry in `sources` carries `source_name`, `sync_enabled`, `status`, `timecode`,
 `latency_ms`, `latency_peak_ms`, `added_ms`, `error_ms`, `required_offset_ms`
 and `timecode_reason` — `ok`, `no_clock`, `codec` or `absent`, which says which

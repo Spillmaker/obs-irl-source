@@ -1041,9 +1041,32 @@ private:
 					 : QStringLiteral("idle — polls while sync is on");
 			fault = cfg.enabled;
 		} else {
+			/* Half the round trip, because what the reader is
+			 * being told is how far the offset could be out,
+			 * not how long the packet was on the wire. A
+			 * decimal below 10ms: a server two milliseconds
+			 * away would otherwise round to the same ±1 ms as
+			 * one three times worse. */
+			const double half_ms = ntp.rtt_ns / 2.0 / 1e6;
 			health = QString("synced %1s ago · ±%2 ms")
 					 .arg(ntp.age_ns / 1000000000ULL)
-					 .arg(ntp.rtt_ns / 2000000LL);
+					 .arg(half_ms, 0, 'f',
+					      half_ms < 10.0 ? 1 : 0);
+			/* The crystal error is the other half of whether
+			 * this clock can be trusted between polls: a
+			 * machine 40 ppm fast moves 2.4ms every minute,
+			 * and on a burst server that is what the client is
+			 * correcting for rather than waiting out. */
+			if (ntp.drift_valid) {
+				health += QStringLiteral(" · ") +
+					  QString::asprintf("%+.1f ppm",
+							    ntp.drift_ppm);
+			}
+			/* Working, but not off the server that was asked
+			 * for, and the name above this line has quietly
+			 * changed to say so. */
+			if (ntp.fallback_active)
+				health += QStringLiteral(" · fallback");
 			/* A stale reference keeps ticking plausibly while
 			 * being wrong, so it reads as a fault too. */
 			fault = cfg.enabled && ntp.age_ns > NTP_STALE_AGE_NS;

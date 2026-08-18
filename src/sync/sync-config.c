@@ -538,6 +538,14 @@ void irl_sync_vendor_status(obs_data_t *request_data,
 	obs_data_set_int(clock, "offset_ms", ntp.offset_ns / 1000000LL);
 	obs_data_set_int(clock, "rtt_ms", ntp.rtt_ns / 1000000LL);
 	obs_data_set_int(clock, "age_ms", (long long)(ntp.age_ns / 1000000ULL));
+	/* Which server is answering, and whether it is the one that was asked
+	 * for: a bot watching this is the thing most likely to notice that
+	 * everyone quietly failed over to the public pool. */
+	obs_data_set_string(clock, "primary_server", ntp.primary);
+	obs_data_set_bool(clock, "burst_mode", ntp.burst_mode);
+	obs_data_set_bool(clock, "fallback_active", ntp.fallback_active);
+	obs_data_set_bool(clock, "drift_valid", ntp.drift_valid);
+	obs_data_set_double(clock, "drift_ppm", ntp.drift_ppm);
 
 	int64_t utc_ns = 0;
 	if (irl_ntp_utc_now_ns(&utc_ns))

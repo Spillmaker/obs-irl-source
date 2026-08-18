@@ -46,7 +46,11 @@ struct irl_source;
  * decoded frames: 30s of a 6Mbit/s feed is about 22MB. The ceiling is here to
  * bound a typo, not because the buffering is expensive. */
 #define IRL_SYNC_MAX_OFFSET_MS 30000
-#define IRL_SYNC_DEFAULT_NTP_SERVER "pool.ntp.org"
+/* A server run for this plugin, so a fresh install lands on the burst polling
+ * policy and the drift correction that comes with it (see sync-ntp.c). It is
+ * only a default: any host can be typed into the dock, and one that is not on
+ * that policy's list is polled at the conventional public-pool cadence. */
+#define IRL_SYNC_DEFAULT_NTP_SERVER "ntp.kringkast.com"
 
 /* The offset is set, and reported, in whole seconds. It is a number
  * co-streamers read to each other to land on the same target, and "six" is a
