@@ -39,6 +39,10 @@
 #include "irl-threading.h"
 #include "pts-repair.h"
 
+/* IRLSync */
+#include "sync/irl-sync-state.h"
+#include "sync/irl-sync.h"
+
 /* The source id registered with OBS. Also what the obs-websocket vendor
  * matches on to tell an IRL source from any other input. */
 #define IRL_SOURCE_ID "irl_source"
@@ -58,6 +62,8 @@ struct irl_source;
 #define IRL_DEFAULT_LOW_LATENCY_AUDIO false
 #define IRL_DEFAULT_CLOSE_WHEN_INACTIVE false
 #define IRL_DEFAULT_CLEAR_ON_DISCONNECT true
+/* IRLSync */
+#define IRL_DEFAULT_SYNC_ENABLED false
 
 /* Min/max buffer are derived from the target rather than exposed as
  * settings: min is the speed controller's low watermark, max is where
@@ -209,6 +215,13 @@ struct irl_config {
 	/* OBS's media source calls this clear_on_media_end and defaults it
 	 * on; same meaning here, minus the local-file cases. */
 	volatile bool clear_on_disconnect; /* hot */
+
+	/* Per-source opt-in toggle for the IRLSync feature.
+	 * Toggling this on adds the source to the list of sources that
+	 * will participate in the timecode synchronization that happens in a dedicated
+	 * dock.
+	 */
+	volatile bool sync_enabled; /* hot */
 };
 
 /* ── Main source context ──────────────────────────────────── */
@@ -491,6 +504,9 @@ struct irl_source {
 	 * across show/activate, which would otherwise restart it. OBS
 	 * thread only, like the callbacks that touch it. */
 	bool media_stopped;
+
+	/* IRLSync object that contains the IRLSync related values. */
+	struct irl_sync_state sync;
 
 	/* Statistics */
 	uint64_t total_audio_frames;

@@ -383,6 +383,9 @@ bool irl_open_stream(struct irl_source *ctx)
 void irl_prepare_new_connection(struct irl_source *ctx)
 {
 	os_atomic_store_bool(&ctx->reconnecting, false);
+	/* IRLSync
+	 * Resets the metadata since we are getting a new feed. */
+	irl_sync_reset(ctx);
 	ctx->first_keyframe_received = false;
 	ctx->video_pkt_gate_open = false;
 	ctx->video_pkt_gate_start_us = 0;
@@ -465,6 +468,11 @@ void irl_handle_stream_read_error(struct irl_source *ctx, int read_ret)
 
 	irl_close_ffmpeg(ctx);
 	pts_repair_reset(&ctx->pts_state);
+	/* ── timecode sync ── */
+	/* IRLSync
+	 * Resets the metadata on any feed errors as to prevent cascading issues.
+	 */
+	irl_sync_reset(ctx);
 
 	/* Blank the source instead of leaving the last decoded frame frozen
 	 * on screen, matching what OBS's own media source does on media end

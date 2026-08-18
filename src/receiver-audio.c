@@ -585,6 +585,43 @@ static bool emit_concealment_silence(struct irl_source *ctx, int frames)
 
 /* ── Offset re-anchor ─────────────────────────────────────── */
 
+/* IRLSync
+ * Where a fresh output clock should start.
+ *
+ * Every restart of the clock line goes through this, not just the first one at
+ * prime. A restart that anchors at "now" throws away the placement sync made,
+ * and the loop can only put it back through the speed controller at 20-50ms a
+ * second — so a single outage would cost the alignment on top of the audio.
+ * Re-placing costs nothing extra, because the clock is being moved either way.
+ *
+ * Returns "now + chunk_ns" — what the plugin does without sync — whenever sync
+ * has nothing to say: sync off, no timecodes, no NTP reference, or a placement
+ * already in the past, which a clock cannot start behind. So a source with sync
+ * off gets master's behaviour, and the callers need no branch of their own.
+ *
+ * The placement is reported here rather than folded into the caller's log line,
+ * so the plugin's own messages read the same with sync on or off.
+ *
+ * Must not be called with audio_state_lock held: the peek takes the buffer
+ * mutex and irl_sync_playout_anchor() takes the state lock. */
+static uint64_t audio_fresh_anchor_ns(struct irl_source *ctx, uint64_t now,
+				      uint64_t chunk_ns)
+{
+	const uint64_t fallback_ns = now + chunk_ns;
+	uint64_t anchor_ns = fallback_ns;
+	int64_t peek_ns = 0;
+
+	if (!audio_buffer_peek_state(&ctx->audio_buf, &peek_ns, NULL, NULL))
+		return fallback_ns;
+	if (!irl_sync_playout_anchor(ctx, peek_ns, now, &anchor_ns))
+		return fallback_ns;
+
+	blog(LOG_INFO,
+	     "[irl-source] IRLSync placed the audio output clock %llums ahead of now",
+	     (unsigned long long)((anchor_ns - now) / 1000000ULL));
+	return anchor_ns;
+}
+
 /* The audio->OBS playout offset is (obs clock end) - (stream PTS end)
  * of the latest chunk handed to OBS; the video path adds this same
  * offset to every frame PTS for lip sync. Concealment freezes the
@@ -639,8 +676,11 @@ static void irl_audio_maybe_reanchor_offset(struct irl_source *ctx,
 
 	/* Lock order note: fill query above takes and releases the buffer
 	 * mutex on its own; the state lock below is never held across it. */
+	/* IRLSync */
+	const uint64_t anchor_ns = audio_fresh_anchor_ns(ctx, now, chunk_ns);
+
 	irl_mutex_lock(&ctx->audio_state_lock);
-	ctx->audio_out_anchor_ns = now + chunk_ns;
+	ctx->audio_out_anchor_ns = anchor_ns;
 	ctx->audio_out_samples = 0;
 	ctx->latest_audio_obs_end_ts_ns = 0;
 	ctx->latest_audio_buffered_end_pts_ns = 0;
@@ -747,7 +787,9 @@ bool irl_pump_audio_once(struct irl_source *ctx)
 			blog(LOG_WARNING,
 			     "[irl-source] Audio output stalled %llums; restarting output clock",
 			     (unsigned long long)((now - next_ts) / 1000000ULL));
-			ctx->audio_out_anchor_ns = now + chunk_ns;
+			/* IRLSync */
+			ctx->audio_out_anchor_ns =
+				audio_fresh_anchor_ns(ctx, now, chunk_ns);
 			ctx->audio_out_samples = 0;
 			ctx->audio_conceal_fade_pending = true;
 		}
@@ -773,6 +815,15 @@ bool irl_pump_audio_once(struct irl_source *ctx)
 		return true;
 
 	if (!ctx->audio_out_primed) {
+		/* Sync seeds a multi-second hold the moment it engages. Priming
+		 * before that means the hold lands on a running pipeline and
+		 * starves it; priming after costs nothing, because nothing is
+		 * playing yet. Bounded by a deadline on the other side, so a
+		 * feed that can never sync still gets audio. */
+		/* ── timecode sync ── */
+		if (irl_sync_prime_held(ctx))
+			return false;
+
 		int prime_ms = 0;
 		if (!low_latency) {
 			prime_ms = ctx->audio_buf.target_ms +
@@ -782,7 +833,13 @@ bool irl_pump_audio_once(struct irl_source *ctx)
 			return false;
 
 		ctx->audio_out_primed = true;
-		ctx->audio_out_anchor_ns = now + chunk_ns;
+		/* IRLSync
+		 * The one instant a stream can be placed exactly and for free:
+		 * nothing is playing yet, so starting later costs only
+		 * pre-roll. Correcting afterwards means moving a running
+		 * pipeline, which only the speed controller can do. */
+		ctx->audio_out_anchor_ns =
+			audio_fresh_anchor_ns(ctx, now, chunk_ns);
 		ctx->audio_out_samples = 0;
 		blog(LOG_INFO,
 		     "[irl-source] Audio output primed (fill=%dms lead=%dms rate=%d)",

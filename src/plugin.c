@@ -10,6 +10,8 @@
 
 #include <obs-module.h>
 #include "../include/irl-source.h"
+/* IRLSync */
+#include "../include/sync/irl-sync.h"
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("obs-irl-source", "en-US")
@@ -39,15 +41,20 @@ static struct obs_source_info irl_source_info = {
 bool obs_module_load(void)
 {
 	obs_register_source(&irl_source_info);
+	/* IRLSync */
+	irl_sync_module_load();
 	return true;
 }
 
 /* Runs after every module's obs_module_load(), which is the only point at
  * which obs-websocket is guaranteed to have published its API. See
- * websocket-vendor.c. */
+ * websocket-vendor.c. We also load the IRLSync Dock here since this is the
+ * step where we know UI exists. */
 void obs_module_post_load(void)
 {
 	irl_websocket_vendor_register();
+	/* IRLSync */
+	irl_sync_module_post_load();
 }
 
 const char *obs_module_description(void)
@@ -63,5 +70,6 @@ const char *obs_module_author(void)
 
 void obs_module_unload(void)
 {
-	/* nothing to clean up globally */
+	/* IRLSync */
+	irl_sync_module_unload();
 }

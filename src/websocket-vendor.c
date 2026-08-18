@@ -32,12 +32,15 @@
 
 #include "../include/irl-source.h"
 #include "../third_party/obs-websocket-api.h"
+#include "../include/sync/irl-sync.h"
 
 #define IRL_VENDOR_NAME "obs-irl-source"
 
 /* Bumped when a request is added or a response field changes meaning, so a
- * client can feature-detect instead of probing. */
-#define IRL_VENDOR_API_VERSION 1
+ * client can feature-detect instead of probing.
+ *
+ * 2: Initial addition of the IRLSync commands */
+#define IRL_VENDOR_API_VERSION 2
 
 #define IRL_ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 
@@ -49,6 +52,7 @@ enum irl_stat_type {
 	IRL_STAT_INT,
 	IRL_STAT_FLOAT,
 	IRL_STAT_BOOL,
+	IRL_STAT_STRING,
 };
 
 struct irl_stat_field {
@@ -87,6 +91,8 @@ static const struct irl_stat_field irl_stat_fields[] = {
 	{"stream_delay_ms", IRL_STAT_INT},
 	{"low_latency_audio", IRL_STAT_BOOL},
 	{"reconnect_count", IRL_STAT_INT},
+	/* ── IRLSync ── */
+	IRL_SYNC_STAT_FIELDS
 };
 
 static void stats_to_obs_data(const calldata_t *cd, obs_data_t *out)
@@ -111,6 +117,12 @@ static void stats_to_obs_data(const calldata_t *cd, obs_data_t *out)
 			bool v = false;
 			calldata_get_bool(cd, f->name, &v);
 			obs_data_set_bool(out, f->name, v);
+			break;
+		}
+		case IRL_STAT_STRING: {
+			const char *v = NULL;
+			calldata_get_string(cd, f->name, &v);
+			obs_data_set_string(out, f->name, v ? v : "");
 			break;
 		}
 		}
@@ -299,6 +311,8 @@ static const struct {
 } irl_vendor_requests[] = {
 	{"GetStats", vendor_get_stats},
 	{"GetSourceList", vendor_get_source_list},
+	/* ── IRLSync ── */
+	{"GetSyncStatus", irl_sync_vendor_status},
 	{"GetVersion", vendor_get_version},
 };
 

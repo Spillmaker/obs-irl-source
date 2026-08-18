@@ -5,7 +5,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 cmake_minimum_required(VERSION 3.16)
-project(obs-irl-source VERSION 1.3.1 LANGUAGES C)
+# Declared CXX here because it wasn't found otherwise.
+project(obs-irl-source VERSION 1.3.1 LANGUAGES C CXX)
 
 set(OBS_IRL_SOURCE_BUILD_VERSION "${PROJECT_VERSION}")
 find_package(Git QUIET)
@@ -24,10 +25,15 @@ if(Git_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
     endif()
 endif()
 
-if(DEFINED OBS_SOURCE_DIR AND EXISTS "${OBS_SOURCE_DIR}/cmake/finders")
+# Make sure the OBS_SOURCE_DIR path uses the same expected slashes as cmake expect.
+if(DEFINED OBS_SOURCE_DIR)
+    file(TO_CMAKE_PATH "${OBS_SOURCE_DIR}" OBS_SOURCE_DIR)
+elseif(DEFINED ENV{OBS_SOURCE_DIR})
+    file(TO_CMAKE_PATH "$ENV{OBS_SOURCE_DIR}" OBS_SOURCE_DIR)
+endif()
+
+if(OBS_SOURCE_DIR AND EXISTS "${OBS_SOURCE_DIR}/cmake/finders")
     list(APPEND CMAKE_MODULE_PATH "${OBS_SOURCE_DIR}/cmake/finders")
-elseif(DEFINED ENV{OBS_SOURCE_DIR} AND EXISTS "$ENV{OBS_SOURCE_DIR}/cmake/finders")
-    list(APPEND CMAKE_MODULE_PATH "$ENV{OBS_SOURCE_DIR}/cmake/finders")
 endif()
 
 # ── Find OBS ─────────────────────────────────────────────────
@@ -40,11 +46,6 @@ if(libobs_FOUND)
     set(_OBS_USE_FIND_PACKAGE ON)
 else()
     set(_OBS_USE_FIND_PACKAGE OFF)
-
-    # Fall back to manual OBS_SOURCE_DIR approach.
-    if(NOT DEFINED OBS_SOURCE_DIR AND DEFINED ENV{OBS_SOURCE_DIR})
-        set(OBS_SOURCE_DIR "$ENV{OBS_SOURCE_DIR}")
-    endif()
 
     set(_OBS_INCLUDE_DIRS "")
     set(_OBS_LIB_DIRS "")
@@ -288,12 +289,45 @@ set(PLUGIN_SOURCES
     src/pts-repair.c
     src/settings.c
     src/websocket-vendor.c
+
+    # IRLSync
+    src/sync/sync-control.c
+    src/sync/sync-ntp.c
+    src/sync/sync-sei.c
+    src/sync/sync-config.c
 )
+
+# Since the UI for IRLSync requires QT which was previously not included in this project
+# the UI itself is optional.
+option(IRL_ENABLE_DOCK "Build the IRL Sync dock (requires Qt6 Widgets)" ON)
+set(_IRL_DOCK OFF)
+
+if(IRL_ENABLE_DOCK)
+    find_package(Qt6 QUIET COMPONENTS Widgets)
+    if(Qt6_FOUND)
+        set(_IRL_DOCK ON)
+        list(APPEND PLUGIN_SOURCES src/sync/sync-dock.cpp)
+    else()
+        message(STATUS
+            "Qt6 Widgets not found; building without the IRL Sync dock. "
+            "Sync still works and is readable over obs-websocket.")
+    endif()
+endif()
 
 add_library(obs-irl-source MODULE ${PLUGIN_SOURCES})
 target_compile_definitions(obs-irl-source PRIVATE
     OBS_IRL_SOURCE_VERSION="${OBS_IRL_SOURCE_BUILD_VERSION}"
 )
+
+if(_IRL_DOCK)
+    set_target_properties(obs-irl-source PROPERTIES AUTOMOC ON)
+    target_compile_definitions(obs-irl-source PRIVATE IRL_ENABLE_DOCK)
+    target_compile_features(obs-irl-source PRIVATE cxx_std_17)
+    target_link_libraries(obs-irl-source PRIVATE Qt6::Widgets)
+    if(NOT WIN32)
+        target_link_libraries(obs-irl-source PRIVATE ${CMAKE_DL_LIBS})
+    endif()
+endif()
 
 # ── Include directories ──────────────────────────────────────
 target_include_directories(obs-irl-source PRIVATE
@@ -363,6 +397,7 @@ endif()
 if(_IRL_BUNDLED)
     set_target_properties(obs-irl-source PROPERTIES
         C_VISIBILITY_PRESET hidden
+        CXX_VISIBILITY_PRESET hidden
         VISIBILITY_INLINES_HIDDEN ON
     )
     if(APPLE)
@@ -403,8 +438,12 @@ if(MSVC)
     set_target_properties(obs-irl-source PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS OFF)
 else()
     target_compile_options(obs-irl-source PRIVATE
-        -Wall -Wextra -Wpedantic
+        -Wall -Wextra
         -Wno-unused-parameter
+    )
+    # Removing noisy compiler warnings for when we compile c++. (The dock)
+    target_compile_options(obs-irl-source PRIVATE
+        $<$<COMPILE_LANGUAGE:C>:-Wpedantic>
     )
 endif()
 
@@ -459,6 +498,11 @@ elseif(LIBAV_FOUND)
     message(STATUS "  FFmpeg:    pkg-config (${LIBAV_VERSION}) — host-provided")
 else()
     message(STATUS "  FFmpeg:    manual (${FFMPEG_DIR}) — host-provided")
+endif()
+if(_IRL_DOCK)
+    message(STATUS "  Sync dock: Qt ${Qt6_VERSION}")
+else()
+    message(STATUS "  Sync dock: disabled (no Qt6)")
 endif()
 message(STATUS "  Install:   ${OBS_PLUGIN_DIR}")
 message(STATUS "")
