@@ -8,20 +8,23 @@ IRL Source is a third-party OBS Studio plugin (Rust 2024, AGPL-3.0) for receivin
 
 Version 2.0.0 is a full port of the 1.x C plugin. The C tree is gone; its last commit (`c727912`) is the specification, and `git show c727912:src/<file>.c` is the way to check what the original did. Behaviour is identical apart from the deliberate deviations listed at the bottom of this file.
 
+Timecode sync is a port of Spillmaker's `nal-timecodes` branch of the C plugin (`Spillmaker/obs-irl-source`, forked from 1.3.1; its `src/sync/` and `include/sync/` are the specification for that feature). `docs/timecode-sync.md` is his design document, adapted to where the code lives now.
+
 ## Build commands
 
-cargo drives everything; there is no CMake. Two prerequisites:
+cargo drives everything; there is no CMake. Two prerequisites, and one optional one:
 
 1. **The bundled media stack.** The plugin statically links its own FFmpeg, libsrt, librist and mbedTLS (see `deps/README.md`), so `./deps/build-deps.sh` runs first. It is incremental, so this is a one-time cost per version bump. It writes `deps/.build/prefix/irl-deps.env`, which `crates/ffmpeg/build.rs` replays as link lines.
 2. **libclang.** `ffmpeg-sys-next` runs bindgen over the bundled headers at build time.
+3. **Qt6 Widgets, optionally,** for the IRL Sync dock. `crates/sync-dock/build.rs` looks for it (`IRL_QT_PREFIX`, then `pkg-config Qt6Widgets`) and compiles the dock's C++ in when it is there; without it the build still succeeds, prints a `cargo::warning`, and the plugin runs timecode sync headless. `IRL_DOCK=0` skips it on purpose. The Qt the dock runs against is the host OBS's own; nothing Qt ships.
 
-libobs is neither built nor linked. `crates/obs-sys` declares the ~58 functions the plugin uses and the symbols resolve against the host OBS process at load time (`raw-dylib` from `obs.dll` on Windows, undefined symbols elsewhere). `libobs-dev` is only needed to *test*.
+libobs is neither built nor linked. `crates/obs-sys` declares the ~64 functions the plugin uses and the symbols resolve against the host OBS process at load time (`raw-dylib` from `obs.dll` on Windows, undefined symbols elsewhere). `libobs-dev` is only needed to *test*.
 
 ### Linux
 
 ```bash
 sudo apt install build-essential cmake pkg-config nasm meson ninja-build \
-    clang libclang-dev libobs-dev libva-dev
+    clang libclang-dev libobs-dev libva-dev qt6-base-dev
 ./deps/build-deps.sh
 cargo build --release
 ./scripts/verify-plugin.sh target/release/libobs_irl_source.so
@@ -76,19 +79,20 @@ make sim          # the speed-controller simulation; not a CI target
 
 `cargo build` names the artifact `libobs_irl_source.so` / `obs_irl_source.dll` / `libobs_irl_source.dylib`. `scripts/package.sh` is what renames it to `obs-irl-source.*` and stages the platform's install layout.
 
-`scripts/verify-plugin.sh` is not optional polish. It asserts what a successful compile does not prove: the binary carries no `libav*` dependency, it exports nothing but `obs_module_*`, its undefined symbols are libobs and libc only, and `#![forbid(unsafe_code)]` is still on `irl-core` and `irl-source`. CI runs it (and a `dumpbin` equivalent on Windows) on every build.
+`scripts/verify-plugin.sh` is not optional polish. It asserts what a successful compile does not prove: the binary carries no `libav*` dependency, it exports nothing but `obs_module_*`, its undefined symbols are libobs and libc only (plus Qt's, when the dock is in), and `#![forbid(unsafe_code)]` is still on `irl-core` and `irl-source`. It also reports whether the dock was linked. CI runs it (and a `dumpbin` equivalent on Windows) on every build.
 
 ## Architecture
 
-One cdylib, five workspace crates. The rule that shapes the split: **all unsafe code lives in `obs-sys`, `obs` and `ffmpeg`.** `irl-core` and `irl-source` carry `#![forbid(unsafe_code)]`, so no port of C pointer arithmetic can sneak in.
+One cdylib, six workspace crates. The rule that shapes the split: **all unsafe code lives in `obs-sys`, `obs`, `ffmpeg` and `sync-dock`.** `irl-core` and `irl-source` carry `#![forbid(unsafe_code)]`, so no port of C pointer arithmetic can sneak in.
 
 | crate | what it is |
 | --- | --- |
 | `crates/obs-sys` | Hand-written libobs FFI: `#[repr(C)]` structs, `extern` declarations, constants. No safety, no abstraction. A `layout-test` feature runs bindgen over the real headers and asserts every field offset. |
 | `crates/obs` | Safe, plugin-agnostic libobs API: the `Source` trait and registration, `declare_module!`, `Data`/`Properties`/`CallData`/`ProcHandler`, `VideoFrame`/`AudioFrame` builders, scene transforms, the obs-websocket vendor helper, `panic::guard`. Knows nothing about IRL streaming. |
 | `crates/ffmpeg` | RAII over `ffmpeg-sys-next` (package `irl-ffmpeg`, lib name `ffmpeg`): `FormatContext`, `CodecContext`, `Frame`, `Packet`, `HwDeviceContext`, `FramePool`, `Resampler`, `Scaler`, `InterruptWatch`, and `log::route_to`, which hands the bundled FFmpeg's `av_log` to a caller-supplied sink. `build.rs` replays `irl-deps.env`. |
-| `crates/irl-core` | Everything that needs neither libobs nor FFmpeg: the jitter buffer, PTS repair, the speed controller, output-clock arithmetic, video pacing, demuxer options, config derivation, the stats table, every tuning constant. Plain data in, plain data out — and therefore the only crate with a real unit-test suite. |
-| `crates/irl-source` | The plugin itself: module entry points, the source lifecycle and the three worker threads. |
+| `crates/irl-core` | Everything that needs neither libobs nor FFmpeg: the jitter buffer, PTS repair, the speed controller, output-clock arithmetic, video pacing, demuxer options, config derivation, the stats table, every tuning constant, and the timecode sync arithmetic (SEI parsing, the sync controller, the NTP math). Plain data in, plain data out — and therefore the only crate with a real unit-test suite. |
+| `crates/irl-source` | The plugin itself: module entry points, the source lifecycle, the three worker threads, and the timecode sync module (settings, registry, NTP thread, the controller's pipeline glue). |
+| `crates/sync-dock` | The IRL Sync dock: Spillmaker's Qt widget from the C plugin (`cxx/sync-dock.cpp`), a C ABI header, and the Rust side of that boundary behind a `DockBackend` trait. Compiled in when `build.rs` finds Qt6, a stub otherwise. The only C++ in the plugin. |
 
 ### Data flow
 
@@ -130,6 +134,9 @@ Buffer regulation happens through playback speed only, asymmetric like IRLToolki
 | `url_opts.rs` | The demuxer option table (probe sizes, SRT latency, RIST/UDP buffers, `tls_verify=0`), parsing of the user's FFmpeg Options, and `url_awaits_caller`, which decides whether the I/O stall deadline applies before a connection exists. |
 | `stats.rs` | `FIELDS`, `StatsSnapshot`, `proc_declaration()`. |
 | `config.rs` | `HwDecode`, `Watermarks::derive`. |
+| `sei.rs` | The HEVC `time_code` SEI reader: Annex B scan, emulation-prevention strip, the `sei_message()` walk, `Timecode`. |
+| `sync.rs` | The timecode sync controller as pure state: `SyncController::observe` takes one packet's worth of inputs (clocks, NTP, settings, the audio playout mapping) and returns what to log, shift, publish and gate. Also `DelayLine<T>`, `ErrorFilter` (trimmed mean), `FpsLearner` (agreement, not maximum), `PeakTracker`, the modulo-hour latency and the playout-anchor arithmetic. Tested on a virtual clock against a simulated sender. |
+| `ntp.rs` | SNTP wire format and reply classification (kiss-o'-death), the burst-host policy, the Theil–Sen drift window and the published `OffsetEstimate`. |
 
 ### `crates/irl-source`
 
@@ -145,6 +152,10 @@ Buffer regulation happens through playback speed only, asymmetric like IRLToolki
 | `audio/{mod,pump}.rs` | The output half of `receiver-audio.c`: the pump, concealment, speed application, re-anchoring. |
 | `video/{mod,thread,decode,intake,output}.rs` | `receiver-video.c`, `video-handler.c` and the video half of `receiver-decode.c`. |
 | `websocket.rs` | `websocket-vendor.c`. |
+| `sync/mod.rs` | `sync-config.c`: the three global settings (atomics plus `sync.json` in the module config dir), the source registry, `fill_stats`, `GetSyncStatus` / `SetSyncConfig`, module lifecycle. |
+| `sync/control.rs` | `sync-control.c`: `SyncControl` on the receiver thread — the `DelayLine<ffmpeg::Packet>`, the `irl_core::sync` controller fed from the pipeline, the log lines — plus `fresh_anchor_ns` / `prime_held` for the audio pump. |
+| `sync/ntp.rs` | `sync-ntp.c`: the `irl-ntp` poll thread over `std::net::UdpSocket`, the two policies, the failover. |
+| `sync/dock.rs` | The `DockBackend` the `sync-dock` crate reads and writes through. |
 
 `update` diffs the new settings against the live config: URL, FFmpeg Options, Hardware Decode and Low Latency Audio are latched at stream open and force a reconnect; everything else is swapped in place through `Config::apply_hot`, so a settings tweak neither drops the connection nor clears the stats counters. Retuning Target Buffer live goes through `AudioBuffer::resize`, which grows the ring (never shrinks it) and only then publishes the new watermarks — if the resize fails the old target stays in force, including in the OBS-thread config that the next diff compares against.
 
@@ -154,9 +165,13 @@ When "Close Stream When Inactive" is enabled, show/activate start the receiver a
 
 `OBS_SOURCE_CONTROLLABLE_MEDIA` and its four callbacks exist because that flag is what makes the source addressable through obs-websocket's `TriggerMediaInputAction` / `GetMediaInputStatus`, which is how NOALBS's `!fix` reconnects a stalled feed (it enumerates candidates by media state, so a source reporting `OBS_MEDIA_STATE_NONE` is invisible to it), and it is also what puts the source in the media controls dock. A live stream has nothing to seek or pause, so they reduce to "run the receiver" and "don't", with a `media_stopped` latch that survives show/activate and is cleared by Restart or a settings edit. Note that `!fix` for `ffmpeg_source` works by writing empty settings, relying on `ffmpeg_source_update` restarting unconditionally; that trick deliberately does not work here, because `update` diffs and hot-applies. Restart is the explicit request.
 
+### Timecode sync
+
+Every packet the demuxer delivers passes through `SyncControl::intercept` on the receiver thread before dispatch: the SEI is read off video packets, the controller measures and moves the hold, and the packet either joins the delay line or is dispatched at once. Due packets are released after every read (`sync_drain`) and while the read loop waits for room. The audio pump reads two atomics (`Shared::sync_flags`) and, under `audio_state`, the `AudioState::sync` link: the priming gate, the smoothed playout bias the anchor is placed from, and the pre-roll handed back for the delay line to absorb. The OBS thread only touches the registry. `docs/timecode-sync.md` has the control model and the list of things that will bite.
+
 ### Threading model and the lock contract
 
-Four threads. The C plugin enforced its lock contract by convention and a debug-only checker; the Rust port enforces most of it by ownership, which is the point of `shared.rs`.
+Five threads while a source runs (the four below plus the module-wide `irl-ntp` poll thread, which shares nothing but its own mutex). The C plugin enforced its lock contract by convention and a debug-only checker; the Rust port enforces most of it by ownership, which is the point of `shared.rs`.
 
 - **OBS thread** — `IrlSource`: create, destroy, update, tick, get_properties, activate/deactivate/show/hide (the last four only matter with "Close Stream When Inactive"). Everything it owns sits in one `Mutex<ObsState>` (config, `fit_pending`, `media_stopped`, the running threads). It is behind a mutex only because the stats proc can arrive on another thread.
 - **`Shared`** — built fresh at every `start_receiver`, which is what replaces the C `reset_runtime_state()`: everything that function zeroed is a field of `Shared` and starts zeroed, and everything it deliberately kept lives in `LifetimeStats`, which is an `Arc` carried across runs.
@@ -169,7 +184,7 @@ Frames are handed to libobs a couple of canvas ticks *before* their due time. li
 
 Video decode is on the video thread and not the receiver for two reasons, and the second is the load-bearing one. Decoding eagerly would mean holding the stream's whole latency as decoded frames — 8s of 4K60 is ~6GB — where the same 8s of packets is ~20MB. And the receiver spends a network stall blocked in `av_read_frame`, which is exactly when video must keep draining the buffer it already has, so the thread that decodes cannot be the thread that reads.
 
-Lock order, and the whole of it: **`audio_state` → `audio_buf` → `hot.watermarks`.** `video.q` is never held together with any of them. The audio pump takes `audio_state` exactly once per iteration and passes `&mut AudioState` down, so nothing below it can take it again — parking_lot mutexes are not recursive, and a nested acquire would hang the audio thread and then the video thread behind it.
+Lock order, and the whole of it: **`audio_state` → `audio_buf` → `hot.watermarks`.** `video.q` is never held together with any of them. Timecode sync adds no edge: the controller takes `audio_state` on its own (never inside another lock), the sync registry and the NTP client each have a mutex nothing else is held under, and the audio pump reaches sync only through `&mut AudioState` and atomics. The audio pump takes `audio_state` exactly once per iteration and passes `&mut AudioState` down, so nothing below it can take it again — parking_lot mutexes are not recursive, and a nested acquire would hang the audio thread and then the video thread behind it.
 
 Hot config (`reconnect_delay_s`, `adaptive_speed`, `catchup_percent`, `wait_for_keyframe`, `clear_on_disconnect`) is atomics, read with `Relaxed` on the worker threads. `catchup_percent` is read once per controller cycle and passed down as a speed, because the ramp, the anti-windup, the actuator clamp and the stuck-drain watch all have to agree on the same ceiling within a cycle. The three watermarks publish together under a mutex because they must never be read torn mid-resize. Stat counters are relaxed atomics: unsynchronised in C, explicitly relaxed here, same values.
 
@@ -177,12 +192,12 @@ Panics never cross an FFI boundary. `obs::panic::guard` wraps every `extern "C"`
 
 ### Conventions
 
-- **Unsafe.** Only in `obs-sys`, `obs` and `ffmpeg`, and every `unsafe` block there carries a `// SAFETY:` comment. If a port needs a raw pointer, the answer is a new safe wrapper in one of those crates, not an `unsafe` block in `irl-source`.
+- **Unsafe.** Only in `obs-sys`, `obs`, `ffmpeg` and `sync-dock`, and every `unsafe` block there carries a `// SAFETY:` comment. If a port needs a raw pointer, the answer is a new safe wrapper in one of those crates, not an `unsafe` block in `irl-source`.
 - **Logging.** `irl_info!("…")`, never `blog` directly; the macros bind the `[irl-source]` prefix. Log strings are part of the interface people grep for — keep them byte-identical to the C where the C had one.
 - **Credentials in the log.** A URL never reaches the log whole. The plugin's own lines go through `log::redacted_input_url` (protocol, host and port; the C `irl_log_input_url`), and FFmpeg's go through `log::redacted_log_line`, because FFmpeg prints `h->filename` — the user's `srt://…?passphrase=…&streamid=…` — for its own connect failures. Anything new that logs a URL, or a string that might contain one, belongs behind one of the two.
 - **Clocks.** OBS timestamps come from `obs::time::gettime_ns` (`os_gettime_ns`), never `std::time::Instant`. FFmpeg-side timers stay in the `av_gettime` microsecond domain. `irl-core` takes both as parameters so the two can never be mixed by accident.
 - **UI strings.** Never pass English text to `module_text`. A new string belongs in two places: the call site and `data/locale/en-US.ini`, keyed by a short identifier. The version in the About block is substituted with `str::replace` on a `%1` token rather than a format string, so a bad translation renders oddly instead of failing.
-- **Stats.** A new stat is *one line* in `irl_core::stats::FIELDS` plus its field in `StatsSnapshot` and `values()`. The proc declaration, the calldata writer (`source.rs`) and the websocket copy loop (`websocket.rs`) all walk that table, so they cannot drift. The README table is the only other place to update.
+- **Stats.** A new stat is *one line* in `irl_core::stats::FIELDS` plus its field in `StatsSnapshot` and `values()`. The proc declaration, the calldata writer (`source.rs`) and the websocket copy loop (`websocket.rs`) all walk that table, so they cannot drift. String stats (`StatKind::String`) travel as calldata strings. The README table is the only other place to update.
 - **Tuning values.** Every threshold lives in `irl_core::consts`, pinned by a test.
 - **Source flags.** `OBS_SOURCE_AUDIO | OBS_SOURCE_ASYNC_VIDEO | OBS_SOURCE_DO_NOT_DUPLICATE | OBS_SOURCE_CONTROLLABLE_MEDIA`.
 
@@ -223,7 +238,7 @@ Releases are tag driven (`.github/workflows/release.yml`, see `RELEASING.md`). P
 The port is behaviour-identical except for these, which are intentional:
 
 1. The dead `network_buffer_mb` setting is gone. Nothing read it; the transport buffer is `irl_core::consts::NETWORK_BUFFER_MB`.
-2. The `video_decoder_flushes` stat is gone (it was always 0 after the video decoder stopped being flushed). 27 stat fields remain.
+2. The `video_decoder_flushes` stat is gone (it was always 0 after the video decoder stopped being flushed). 27 stat fields remain from the 1.x plugin; timecode sync adds eight (35 in all).
 3. `irl-stats.lua` finds the source by its plugin id instead of by display name, and takes source names as script properties.
 4. The vestigial `hw_map_ok` flag is not ported.
 5. `w32-pthreads.dll` is no longer shipped on Windows: Rust never calls `pthread_*`, so the librist shim hazard that `include/irl-threading.h` existed for is gone. The installer deletes a stale copy.
@@ -236,6 +251,9 @@ The port is behaviour-identical except for these, which are intentional:
 12. The I/O stall deadline is not armed while a listener URL waits to be called, and once connected it is measured from the last byte that arrived rather than from the start of the call (master `6d09dea`). `InterruptWatch` therefore tracks the `AVFormatContext` so the callback can read `pb->bytes_read`; `FormatContext` clears that pointer on a failed open and in `Drop`, which cannot wait for the watch's own `Drop` because the receiver holds the same `Arc` across connections.
 13. Video is decoded on the video thread, just before each frame is due, and the receiver → video queue carries compressed packets instead of decoded frames. The C decoded eagerly on the receiver thread, which made the Target Buffer cost decoded-frame memory: 1 GiB of pacing budget is 5.7s of 1080p60 but only 1.4s of 4K60 and 0.7s of 4K60 10-bit, and past that frames were emitted early and dropped. Decoded memory is now bounded by `VIDEO_DECODE_LEAD_MS` regardless of the target. `PacingQueue` gained the matching soft/hard bound split: holding the decode lead is normal and must not emit early, while the byte and frame ceilings are memory limits that still do. The stats line reports `pktq=` instead of `pinned_peak=`, since no decoded frame pins a decoder surface any more.
 14. PTS repair treats a gap of at most one time-base tick, in either direction, as the sender being on time rather than as a discontinuity. The C tested only `< 1 ms` and only forwards, which is a threshold a 90 kHz clock cannot express a 44.1 kHz frame against: 1024 samples is 2089.795 ticks and `duration` can carry only 2090, so the stream landed a tick *early* every few frames, fell into the leading-edge rule for backward jumps (which deliberately freezes the baseline), and the next frame was then interpolated onto the frozen baseline. The repaired timeline stayed one frame short from there on. Since the audio→video mapping is derived from those PTS, every 44.1 kHz stream — which is what phone encoders send — carried a standing ~23 ms lip-sync error, and its `norm=` counter climbed at the frame rate. 48 kHz divides 90 kHz exactly and was never affected.
+15. Timecode sync's dock is the C branch's Qt widget compiled through `cc` from `crates/sync-dock` when Qt6 is found, not a Rust rewrite: obs-frontend-api only hosts a QWidget, and a working widget is worth more than a second one. Where the C read `struct irl_source` and locked `audio_state_lock` inside the controller, the controller is pure (`irl_core::sync`) and the receiver hands it its inputs per packet.
+16. `SetSyncConfig` exists on the websocket vendor. The C branch's three global settings were only reachable through the dock; here the dock is optional at build time, and a bot that reads `recommended_offset_ms` from `GetSyncStatus` can act on it.
+17. The NTP client uses a connected UDP socket per query (`std::net`), so a stray datagram from another host cannot be read as the reply; the C used an unconnected `recv`. Same offset arithmetic, same timeout, same policies.
 
 ## Contributing
 

@@ -18,6 +18,8 @@ An OBS source built for IRL streams. Point it at your SRT or RTMP pull URL and i
 
 **Less clicking around.** A source you just added sizes itself to your canvas on the first frame, so there is no manual Fit to screen step.
 
+**Multiple feeds cut in time.** Timecode sync holds each feed until the moment it was captured plus a shared offset, so a main camera and a chase camera arriving over different uplinks show the same instant at the same instant, and two OBS instances on the same offset composite the same moment. Needs a sender that stamps SEI timecodes (Moblin, H.265 over SRT/SRTLA/RIST) and an NTP reference; see [Timecode sync](docs/timecode-sync.md).
+
 Works with SRT, RTMP, RIST, UDP, TCP, HTTP, or anything else FFmpeg can open, and with H.264, HEVC (including 10-bit), AV1, VP9, AAC and Opus.
 
 ## Why not the built-in Media Source?
@@ -93,9 +95,10 @@ A source you just added sizes itself to the canvas when its first frame arrives,
 | Wait for Keyframe | On | Hold video back until a clean frame arrives, so you never see blocky garbage on join |
 | Low Latency Audio | Off | Play audio the moment it arrives, with no cushion. Lowest delay, least tolerant of a wobbly connection |
 | Show Nothing When the Stream Ends | On | Blank the source as soon as the stream drops, instead of leaving the last frame frozen on screen until it reconnects. Same idea as the media source's "Show nothing when playback ends" |
+| Sync | Off | Include this source in timecode sync. The master switch, the shared offset and the NTP server are set once for every source, in the IRL Sync dock (View → Docks) or over obs-websocket; see [Timecode sync](docs/timecode-sync.md) |
 | Close Stream When Inactive | Off | Stop pulling the stream when the source is neither showing nor active (the last frame goes black if Show Nothing When the Stream Ends is on), and reconnect when it becomes visible again |
 
-Target Buffer, Reconnect Delay, Adaptive Latency Control, Catch-Up Speed, Wait for Keyframe, Show Nothing When the Stream Ends and Close Stream When Inactive can be changed while the stream is running. The connection stays up and the stats counters keep counting. The one exception is turning Close Stream When Inactive on while the source is already hidden, which is a request to stop receiving: that drops the connection and resets the stats counters, as it would on any later hide. Changing Target Buffer mid-stream keeps every buffered sample and walks the latency to the new value at up to the Catch-Up Speed or -2%, so you should not hear a seam. Changing URL, FFmpeg Options, Hardware Decode or Low Latency Audio reconnects, because those are set when the stream is opened.
+Target Buffer, Reconnect Delay, Adaptive Latency Control, Catch-Up Speed, Wait for Keyframe, Show Nothing When the Stream Ends, Sync and Close Stream When Inactive can be changed while the stream is running. The connection stays up and the stats counters keep counting. The one exception is turning Close Stream When Inactive on while the source is already hidden, which is a request to stop receiving: that drops the connection and resets the stats counters, as it would on any later hide. Changing Target Buffer mid-stream keeps every buffered sample and walks the latency to the new value at up to the Catch-Up Speed or -2%, so you should not hear a seam. Changing URL, FFmpeg Options, Hardware Decode or Low Latency Audio reconnects, because those are set when the stream is opened.
 
 Earlier versions exposed Min/Max Buffer, PTS gap thresholds, Network Buffer and Decoupled Audio. Those are now fixed or derived internally, so old scene collections keep working and ignore the stored values.
 
@@ -124,6 +127,8 @@ Vendor name: `obs-irl-source`.
 | --- | --- | --- |
 | `GetStats` | `source_name`, optional when the scene collection has exactly one IRL source | `source_name` plus every field in [Stats reference](#stats-reference) |
 | `GetSourceList` | none | `sources`: array of `{source_name, active, showing}` |
+| `GetSyncStatus` | none | The whole timecode sync picture: `sync_enabled`, `offset_ms`, `clock`, `sources`, `out_of_sync_count`, `recommended_offset_ms`. See [Timecode sync](docs/timecode-sync.md#reading-status-over-obs-websocket) |
+| `SetSyncConfig` | any of `sync_enabled` (bool), `offset_ms` (int, clamped to 0–30000), `ntp_server` (string) | The three settings as they stand afterwards |
 | `GetVersion` | none | `plugin_version`, `vendor_api_version`, `obs_websocket_api_version` |
 
 Every response carries `success`. When it is `false`, `error` says why: no source by that name, that source is not an IRL Source, no IRL Source at all, or more than one with no `source_name` given. Stream URLs are deliberately not exposed, because they can carry an SRT passphrase or a stream key and every connected client would see them.
@@ -141,6 +146,8 @@ console.log(responseData.stream_delay_ms, responseData.buffer_fill_ms);
 ```
 
 There is no event stream, so poll `GetStats` at whatever rate your overlay refreshes; once a second is plenty. The request reads the same snapshot the Lua path does, so both transports always report identical numbers.
+
+`vendor_api_version` is 2 as of the timecode sync requests; a client that needs them can feature-detect on it instead of probing.
 
 ## Restarting the stream remotely
 
@@ -170,6 +177,10 @@ The initial version of this plugin was heavily built with LLM assistance. That i
 Rest assured I will go through both the README and codebase and clean this up, once I have the initial builds working well.
 
 Any tagged release should at least be fully tested, single commits might not (though i will try to use branches).
+
+## Credits
+
+Timecode sync — the SEI timecode reader, the NTP client, the delay-line controller and the IRL Sync dock — was designed and written by [Spillmaker](https://github.com/Spillmaker) for the C plugin (`nal-timecodes`), and ported to the Rust plugin from there. The dock is his Qt widget, carried over as C++.
 
 ## Contributing
 
@@ -319,6 +330,14 @@ Stats are exposed through OBS's `proc_handler` API under the `get_stats` call, a
 | `stream_delay_ms` | int | End-to-end stream delay (SRT latency + decode + buffering) |
 | `low_latency_audio` | bool | Whether OBS async unbuffered low-latency mode is enabled |
 | `reconnect_count` | int | Number of reconnect attempts since the source was created |
+| `sync_enabled` | bool | Whether this source is ticked for timecode sync |
+| `sync_status` | string | `off`, `no_timecode`, `stale`, `too_slow`, `acquiring` or `locked` |
+| `sync_timecode` | string | Most recent timecode from the sender, `HH:MM:SS:FF`, empty when none |
+| `sync_latency_ms` | int | How stale the freshest received frame is, from its timecode against NTP |
+| `sync_latency_peak_ms` | int | Rolling 60s maximum of the above. Pick an offset against this, not the instantaneous value |
+| `sync_added_ms` | int | Extra hold currently applied to reach the target presentation time |
+| `sync_error_ms` | int | How far the actual presentation lands from the target, averaged over about a second. Near zero when locked. Shown in the dock as **Drift** |
+| `sync_required_offset_ms` | int | Smallest offset at which this source could hold sync: its peak latency rounded up to a whole second |
 
 ### OBS log stats
 
@@ -333,6 +352,8 @@ A healthy stream shows `speed=1.000`, `underruns=0`, `restarts=0`, and a constan
 ## Building from source
 
 The plugin is a Rust workspace under `crates/`, built with cargo. It statically links its own FFmpeg, libsrt, librist and mbedTLS rather than using OBS's, so building that stack is the first step; it only has to happen again when a version in `deps/versions.env` changes. See `deps/README.md` for the details.
+
+The IRL Sync dock is the one part that needs Qt6. It is built in when Qt6 Widgets is found (`qt6-base-dev` on Linux, or `IRL_QT_PREFIX` pointing at a Qt install such as the `*-deps-qt6-*` archives from [obs-deps](https://github.com/obsproject/obs-deps/releases) on Windows and macOS) and skipped with a build warning otherwise. Without it timecode sync still runs and is fully operable over obs-websocket; you just get no dock. `IRL_DOCK=0` skips it deliberately.
 
 libobs is neither built nor linked: the plugin binds to it through hand-written FFI (`crates/obs-sys`) and resolves the symbols from the OBS process at load time. libclang is a build dependency, because bindgen generates the FFmpeg bindings during the build.
 
