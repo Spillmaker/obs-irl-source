@@ -142,6 +142,112 @@ fn expected_ts(anchor: u64, samples: u64, rate: u64) -> u64 {
 
 // ── Tests ─────────────────────────────────────────────────────
 
+/// Lip sync, measured on the audio content rather than on the bookkeeping:
+/// a ramp encodes each sample's media time, so where a sample actually lands
+/// on the OBS clock can be compared with where [`map_through_playout`] would
+/// put the video frame carrying the same media time.
+///
+/// 44.1 kHz is the interesting rate. 1024 samples is 2089.795 ticks of the
+/// 90 kHz clock MPEG-TS uses, so the duration the container can carry is 2090
+/// and the stream lands a tick short of the prediction every few frames — the
+/// rate every phone encoder sends, and the only one where the repaired
+/// timeline can slip against the frames it labels.
+///
+/// [`map_through_playout`]: irl_core::video_time::map_through_playout
+#[test]
+fn planar_aac_samples_follow_the_video_playout_mapping() {
+    /// Two chunks of PI settling, comfortably inside the ~45 ms at which
+    /// audio running ahead of picture becomes visible.
+    const TOLERANCE_NS: i64 = 5_000_000;
+
+    for rate in [44_100, 48_000] {
+        let shared = make_shared(false, true);
+        let clock = Arc::new(AtomicU64::new(10_000_000_000));
+        let recorder = Recorder::new(CHANNELS as usize);
+        let ns = Arc::clone(&clock);
+        let us = Arc::clone(&clock);
+        let mut pump = AudioPump::with_sink(shared.clone(), Box::new(recorder.clone()))
+            .with_clock(Box::new(move || ns.load(Relaxed)))
+            .with_us_clock(Box::new(move || us.load(Relaxed) / 1000));
+        let tb = ffmpeg::Rational::new(1, 90_000);
+        let mut intake = AudioIntake::new(&shared.cfg);
+        intake.init_pts_repair(&shared.cfg, tb);
+        let mut flags = ReceiverFlags::default();
+        let mut worst_ns = 0i64;
+        let mut checked = 0;
+
+        for chunk in 0..8_000i64 {
+            let first_sample = chunk * 1024;
+            let frame = aac_frame(rate, first_sample, tb);
+            clock.store(
+                10_000_000_000 + first_sample as u64 * 1_000_000_000 / rate as u64,
+                Relaxed,
+            );
+            intake.handle_frame(&shared, &mut flags, &frame, tb);
+
+            while pump.pump_once() {
+                let Some(out) = recorder.emitted.lock().pop() else {
+                    continue;
+                };
+                // Skip the priming transient and any chunk too short to sample
+                // in the middle.
+                if chunk <= 100 || out.frames <= 64 {
+                    continue;
+                }
+                let i = out.frames as usize / 2;
+                let content_pts = (out.samples[i * CHANNELS as usize] as f64 * 1e9) as i64;
+                let audio_due = out.timestamp + i as u64 * 1_000_000_000 / rate as u64;
+                let state = shared.audio_state();
+                let video_due = irl_core::video_time::map_through_playout(
+                    content_pts,
+                    state.latest_obs_end_ts_ns,
+                    state.latest_buffered_end_pts_ns,
+                );
+                worst_ns = worst_ns.max((audio_due as i64 - video_due as i64).abs());
+                checked += 1;
+            }
+        }
+
+        assert!(
+            checked > 7_000,
+            "rate={rate}: only {checked} chunks sampled"
+        );
+        assert!(
+            worst_ns <= TOLERANCE_NS,
+            "rate={rate}: audio ran {:.1}ms away from the video the mapping \
+places at the same media time",
+            worst_ns as f64 / 1e6
+        );
+    }
+}
+
+/// One 1024-sample planar-float frame, the shape an AAC decoder hands over,
+/// timestamped in `tb` and filled with a ramp reading `1.0 + media seconds`.
+fn aac_frame(rate: i32, first_sample: i64, tb: ffmpeg::Rational) -> ffmpeg::Frame {
+    let mut frame = ffmpeg::Frame::new().unwrap();
+    // SAFETY: a fresh frame is configured before its buffers are allocated,
+    // and `av_frame_get_buffer` then owns exactly `nb_samples` floats per
+    // plane, which is what the fill below writes.
+    unsafe {
+        let raw = frame.as_mut_ptr();
+        (*raw).format = ffmpeg::AVSampleFormat::AV_SAMPLE_FMT_FLTP as i32;
+        (*raw).nb_samples = 1024;
+        (*raw).sample_rate = rate;
+        let rate = rate as i64;
+        (*raw).pts = tb.den as i64 + (first_sample * tb.den as i64 + rate / 2) / rate;
+        (*raw).duration = (1024 * tb.den as i64 + rate / 2) / rate;
+        ffmpeg::sys::av_channel_layout_default(&raw mut (*raw).ch_layout, CHANNELS);
+        assert_eq!(ffmpeg::sys::av_frame_get_buffer(raw, 0), 0);
+        for ch in 0..CHANNELS as usize {
+            let plane = std::slice::from_raw_parts_mut((*raw).data[ch].cast::<f32>(), 1024);
+            for (i, sample) in plane.iter_mut().enumerate() {
+                *sample = (1.0 + (first_sample + i as i64) as f64 / rate as f64) as f32;
+            }
+        }
+    }
+    frame
+}
+
 #[test]
 fn a_pump_burst_stops_when_disconnect_pauses_playback() {
     let shared = make_shared(false, false);

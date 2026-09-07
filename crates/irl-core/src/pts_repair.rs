@@ -96,8 +96,36 @@ impl PtsRepair {
         let is_backward = gap < 0;
         self.last_action_gap_ms = gap_ms;
 
+        // Essentially aligned, in either direction: under a millisecond, or
+        // within one tick of the stream's own time base. Re-baseline on the
+        // PTS the sender actually sent.
+        //
+        // The tick test is what makes a frame duration the container cannot
+        // express harmless. 1024 samples at 44.1 kHz is 2089.8 ticks of a
+        // 90 kHz clock and `duration` can only carry 2090, so the stream lands
+        // one tick *before* the prediction every few frames; over RTMP's
+        // millisecond time base a frame is 23.22 ticks against a carried 23.
+        // Without this, the backward wobble falls into the leading-edge rule
+        // below, which deliberately freezes the baseline — and the next frame
+        // then reads as a whole-frame forward gap and gets interpolated onto
+        // the frozen baseline. The repaired timeline is a frame short from
+        // there on and never recovers it, which lands as a standing ~23 ms
+        // offset in the audio→video playout mapping on every 44.1 kHz stream.
+        if gap_ms < 1 || gap.abs() <= 1 {
+            self.last_pts = pts;
+            self.last_duration = if duration > 0 {
+                duration
+            } else {
+                self.last_duration
+            };
+            self.last_gap_ms = 0;
+            self.consecutive_small_repairs = 0;
+            self.relocking = false;
+            return self.verdict(PtsAction::Pass, pts, 0);
+        }
+
         if is_backward {
-            // Small backward jumps look like B-frame reorder or decoder ts
+            // Larger backward jumps look like B-frame reorder or decoder ts
             // wobble. Pass through without updating last_pts so the baseline
             // keeps tracking the leading edge of the stream.
             if gap_ms < self.small_gap_ms {
@@ -116,20 +144,6 @@ impl PtsRepair {
             self.consecutive_small_repairs = 0;
             self.relocking = false;
             return self.verdict(PtsAction::Reset, pts, 0);
-        }
-
-        // Tiny forward gap (< 1 ms): essentially aligned, pass through.
-        if gap_ms < 1 {
-            self.last_pts = pts;
-            self.last_duration = if duration > 0 {
-                duration
-            } else {
-                self.last_duration
-            };
-            self.last_gap_ms = 0;
-            self.consecutive_small_repairs = 0;
-            self.relocking = false;
-            return self.verdict(PtsAction::Pass, pts, 0);
         }
 
         let action;
@@ -272,6 +286,53 @@ mod tests {
 
     fn repair() -> PtsRepair {
         PtsRepair::new(consts::SMALL_GAP_MS, consts::LARGE_GAP_MS, TB_NUM, TB_DEN)
+    }
+
+    /// 1024 samples at 44.1 kHz is 2089.795 ticks of a 90 kHz clock, so the
+    /// duration the container carries is 2090 and the stream lands one tick
+    /// early every few frames. The repaired timeline must track the sender,
+    /// not lose a frame to it: the audio→video playout mapping is derived from
+    /// these PTS, so a frame lost here is a standing ~23 ms lip-sync error on
+    /// every 44.1 kHz stream. 48 kHz divides the 90 kHz clock exactly and was
+    /// never affected, which is why this only ever showed on phone encoders.
+    #[test]
+    fn a_frame_duration_the_time_base_cannot_express_does_not_lose_a_frame() {
+        for (rate, tb_den) in [(44_100i64, 90_000i64), (44_100, 1_000), (48_000, 90_000)] {
+            let mut repair =
+                PtsRepair::new(consts::SMALL_GAP_MS, consts::LARGE_GAP_MS, 1, tb_den as i32);
+            let duration = (1024 * tb_den + rate / 2) / rate;
+            for chunk in 0..2_000i64 {
+                let pts = (chunk * 1024 * tb_den + rate / 2) / rate;
+                let verdict = repair.evaluate(pts, duration);
+                assert_eq!(
+                    verdict.action,
+                    PtsAction::Pass,
+                    "rate={rate} tb=1/{tb_den} chunk={chunk}: a rounding wobble is not a gap"
+                );
+                assert_eq!(verdict.corrected_pts, pts, "rate={rate} tb=1/{tb_den}");
+            }
+        }
+    }
+
+    /// The leading-edge rule still holds for a backward jump big enough to be
+    /// a real reorder: the baseline stays on the leading frame, so the frame
+    /// that follows it is not read as a gap.
+    #[test]
+    fn a_reorder_sized_backward_jump_still_leaves_the_baseline_alone() {
+        let mut repair = repair();
+        repair.evaluate(0, DUR);
+        repair.evaluate(DUR, DUR);
+        // The stream jumps a frame ahead, which the small-gap path repairs on
+        // to the expected PTS, and then delivers the frame it skipped: 20 ms
+        // back, far past a tick of rounding and well inside the small gap.
+        assert_eq!(repair.evaluate(3 * DUR, DUR).action, PtsAction::Interpolate);
+        let verdict = repair.evaluate(2 * DUR, DUR);
+        assert_eq!(verdict.action, PtsAction::Pass);
+        assert_eq!(verdict.corrected_pts, 2 * DUR);
+        // The baseline never left the leading edge, so the next frame in order
+        // is not a gap either.
+        assert_eq!(repair.evaluate(3 * DUR, DUR).action, PtsAction::Pass);
+        assert_eq!(repair.last(), Some((3 * DUR, DUR)));
     }
 
     fn ms(v: i64) -> i64 {
