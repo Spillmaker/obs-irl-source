@@ -116,7 +116,7 @@ fn drain_audio_frames(
 /// shows up in diagnostics.
 impl Receiver {
     /// `irl_handle_audio_packet`.
-    pub(super) fn handle_audio_packet(&mut self) {
+    pub(super) fn handle_audio_packet(&mut self, pkt: &ffmpeg::Packet) {
         let audio_tb = self.audio_tb;
         let Self {
             shared,
@@ -124,7 +124,6 @@ impl Receiver {
             frame,
             flags,
             audio_in,
-            pkt,
             ..
         } = self;
         let Some(dec) = audio_dec.as_mut() else {
@@ -185,16 +184,15 @@ impl Receiver {
     /// packets and decoded just before display, which is what makes a deep
     /// Target Buffer affordable at 4K — and it has to be the video thread that
     /// decodes, because this one spends a stall blocked in `av_read_frame`.
-    pub(super) fn push_video_packet(&mut self) {
+    pub(super) fn push_video_packet(&mut self, pkt: &ffmpeg::Packet) {
         // Only used to bound the queue by media duration; output timing comes
         // from the decoded frame's own PTS, after repair.
-        let pts_ns = self
-            .pkt
+        let pts_ns = pkt
             .pts_or_dts()
             .map_or(0, |pts| ffmpeg::rescale_q(pts, self.video_tb, NS_TIME_BASE));
-        let bytes = self.pkt.size().max(0) as usize;
+        let bytes = pkt.size().max(0) as usize;
 
-        match self.pkt.new_ref() {
+        match pkt.new_ref() {
             Ok(packet) => self.shared.video.push_packet(
                 TimedPacket {
                     packet,
