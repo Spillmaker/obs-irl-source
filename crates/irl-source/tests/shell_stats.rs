@@ -66,6 +66,9 @@ fn every_declared_field_is_written_with_its_declared_type() {
                 assert_eq!(cd.get_bool(&key), Some(v), "{name}");
                 assert_eq!(cd.get_i64(&key), None, "{name} read back as int");
             }
+            (StatKind::String, StatValue::Str(v)) => {
+                assert_eq!(cd.get_str(&key), Some(v.as_str()), "{name}");
+            }
             (kind, value) => panic!("{name}: declared {kind:?} but written as {value:?}"),
         }
     }
@@ -82,6 +85,8 @@ fn a_default_snapshot_writes_zeroes_not_absences() {
             StatKind::Int => assert_eq!(cd.get_i64(&key), Some(0), "{name}"),
             StatKind::Float => assert_eq!(cd.get_f64(&key), Some(0.0), "{name}"),
             StatKind::Bool => assert_eq!(cd.get_bool(&key), Some(false), "{name}"),
+            // An empty string is present, not absent.
+            StatKind::String => assert!(cd.get_str(&key).is_some(), "{name}"),
         }
     }
 }

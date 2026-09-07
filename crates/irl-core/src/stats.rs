@@ -11,10 +11,12 @@ pub enum StatKind {
     Float,
     /// `bool`.
     Bool,
+    /// `string` (NUL-terminated, copied into the calldata).
+    String,
 }
 
 /// A value of one stat.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum StatValue {
     /// Integer.
     Int(i64),
@@ -22,6 +24,8 @@ pub enum StatValue {
     Float(f64),
     /// Bool.
     Bool(bool),
+    /// String.
+    Str(String),
 }
 
 /// The 27 stat fields in proc-declaration order.
@@ -121,6 +125,7 @@ impl StatKind {
             Self::Int => "int",
             Self::Float => "float",
             Self::Bool => "bool",
+            Self::String => "string",
         }
     }
 }
@@ -163,7 +168,7 @@ impl StatsSnapshot {
     /// websocket vendor's copy loop walks [`FIELDS`] instead).
     pub fn get(&self, name: &str) -> Option<StatValue> {
         let index = FIELDS.iter().position(|(field, _)| *field == name)?;
-        Some(self.values()[index])
+        Some(self.values()[index].clone())
     }
 }
 
@@ -278,6 +283,7 @@ out int reconnect_count)";
                 (StatKind::Int, StatValue::Int(_))
                     | (StatKind::Float, StatValue::Float(_))
                     | (StatKind::Bool, StatValue::Bool(_))
+                    | (StatKind::String, StatValue::Str(_))
             );
             assert!(matches, "{name} has the wrong value kind: {value:?}");
         }
@@ -317,6 +323,7 @@ out int reconnect_count)";
                 StatValue::Int(v) => *v == 0,
                 StatValue::Float(v) => *v == 0.0,
                 StatValue::Bool(v) => !*v,
+                StatValue::Str(s) => s.is_empty(),
             };
             assert!(zero, "{} defaulted to {value:?}", FIELDS[i].0);
         }

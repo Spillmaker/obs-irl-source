@@ -517,6 +517,13 @@ pub fn write_stats(cd: &mut CallData, snap: &StatsSnapshot) {
             StatValue::Int(v) => cd.set_i64(&name, v),
             StatValue::Float(v) => cd.set_f64(&name, v),
             StatValue::Bool(v) => cd.set_bool(&name, v),
+            // A string stat cannot carry a NUL; one that somehow did is
+            // skipped rather than truncated.
+            StatValue::Str(v) => {
+                if let Ok(v) = CString::new(v) {
+                    cd.set_str(&name, &v);
+                }
+            }
         }
     }
 }

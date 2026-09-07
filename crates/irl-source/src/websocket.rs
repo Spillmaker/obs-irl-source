@@ -175,6 +175,10 @@ fn get_stats(request: &Data<'_>, response: &OwnedData) {
             StatKind::Int => response.set_i64(&key, cd.get_i64(&key).unwrap_or(0)),
             StatKind::Float => response.set_f64(&key, cd.get_f64(&key).unwrap_or(0.0)),
             StatKind::Bool => response.set_bool(&key, cd.get_bool(&key).unwrap_or(false)),
+            StatKind::String => {
+                let value = CString::new(cd.get_str(&key).unwrap_or("")).unwrap_or_default();
+                response.set_str(&key, &value);
+            }
         }
     }
     response.set_bool(c"success", true);
