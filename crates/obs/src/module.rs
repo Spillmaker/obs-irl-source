@@ -33,6 +33,42 @@ pub fn current_module() -> *mut obs_sys::obs_module_t {
     MODULE.load(Ordering::Acquire)
 }
 
+/// `obs_module_get_config_path(obs_current_module(), file)`: the path of
+/// `file` inside this module's own configuration directory, as an owned copy.
+/// Pass an empty `file` for the directory itself. `None` before libobs has
+/// handed over the module pointer, or when libobs cannot form the path.
+///
+/// The directory is not created by libobs; see [`mkdirs`].
+#[must_use]
+pub fn config_path(file: &CStr) -> Option<String> {
+    let module = current_module();
+    if module.is_null() {
+        return None;
+    }
+    // SAFETY: `module` is the pointer libobs handed to obs_module_set_pointer
+    // and `file` is NUL-terminated; libobs returns a bmalloc'd string or NULL.
+    let raw = unsafe { obs_sys::obs_module_get_config_path(module, file.as_ptr()) };
+    if raw.is_null() {
+        return None;
+    }
+    // SAFETY: non-NULL, NUL-terminated, and owned by this call until the
+    // `bfree` below, which happens exactly once.
+    let path = unsafe { CStr::from_ptr(raw) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { obs_sys::bfree(raw.cast()) };
+    Some(path)
+}
+
+/// `os_mkdirs`: create `dir` and every missing parent. Returns whether the
+/// directory exists afterwards (created now, or already there).
+pub fn mkdirs(dir: &CStr) -> bool {
+    // SAFETY: NUL-terminated path, read only during the call.
+    let ret = unsafe { obs_sys::os_mkdirs(dir.as_ptr()) };
+    // MKDIR_SUCCESS (0) or MKDIR_EXISTS (1); MKDIR_ERROR is -1.
+    ret >= 0
+}
+
 /// `obs_module_set_locale`: destroy the previous lookup and load
 /// `default_locale`/`locale` for the current module.
 ///
