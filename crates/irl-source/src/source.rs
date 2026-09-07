@@ -94,7 +94,7 @@ impl Source for IrlSource {
                 Some(source.proc_handler().add(
                     &decl,
                     Box::new(move |cd: &mut CallData| {
-                        write_stats(cd, &snapshot(&state.lock(), &lifetime));
+                        write_stats(cd, &snapshot(source, &state.lock(), &lifetime));
                     }),
                 ))
             }
@@ -103,6 +103,10 @@ impl Source for IrlSource {
                 None
             }
         };
+
+        // Timecode sync: the registry the dock and the websocket vendor
+        // enumerate. Before the receiver starts, so its first publish lands.
+        crate::sync::register_source(source, obs_state.lock().config.hot.sync_enabled);
 
         {
             let mut state = obs_state.lock();
@@ -125,6 +129,7 @@ impl Source for IrlSource {
 
     fn update(&self, settings: &Data<'_>) {
         let mut next = Config::load(settings);
+        crate::sync::set_source_sync_enabled(self.source, next.hot.sync_enabled);
         let mut state = self.obs_state.lock();
 
         // Editing the source is a request to have it running again.
@@ -298,6 +303,9 @@ impl Drop for IrlSource {
     /// going away, so there is nothing left to show it on.
     fn drop(&mut self) {
         stop_receiver(&mut self.obs_state.lock(), self.source, false);
+        // After the receiver is gone (it publishes to the registry), before
+        // libobs tears the source down (the registry reads its name).
+        crate::sync::unregister_source(self.source);
         // Explicit for order's sake: the closure the callback owns holds an
         // `Arc<Mutex<ObsState>>`, and dropping it here (before libobs tears
         // down the source's proc handler) is what makes the borrow safe.
@@ -446,7 +454,7 @@ fn fit_to_canvas(source: SourceHandle) {
 /// With no run in progress the per-connection counters read zero — the C read
 /// the same fields after `reset_runtime_state` had zeroed them — while the
 /// lifetime counters and the settings-derived flags still report.
-fn snapshot(state: &ObsState, lifetime: &LifetimeStats) -> StatsSnapshot {
+fn snapshot(source: SourceHandle, state: &ObsState, lifetime: &LifetimeStats) -> StatsSnapshot {
     let mut snap = StatsSnapshot {
         current_speed: 1.0,
         adaptive_latency_control: state.config.hot.adaptive_speed,
@@ -455,6 +463,9 @@ fn snapshot(state: &ObsState, lifetime: &LifetimeStats) -> StatsSnapshot {
         reconnect_count: lifetime.reconnect_count.load(Relaxed) as i64,
         ..StatsSnapshot::default()
     };
+    // Timecode sync comes from the registry (the receiver thread's published
+    // view), so it reports whether or not a run is in progress.
+    crate::sync::fill_stats(source, state.config.hot.sync_enabled, &mut snap);
 
     let Some(running) = state.running.as_ref() else {
         return snap;
@@ -517,8 +528,8 @@ pub fn write_stats(cd: &mut CallData, snap: &StatsSnapshot) {
             StatValue::Int(v) => cd.set_i64(&name, v),
             StatValue::Float(v) => cd.set_f64(&name, v),
             StatValue::Bool(v) => cd.set_bool(&name, v),
-            // A string stat cannot carry a NUL; one that somehow did is
-            // skipped rather than truncated.
+            // A status name or a timecode, neither of which can carry a NUL;
+            // one that somehow did is skipped rather than truncated.
             StatValue::Str(v) => {
                 if let Ok(v) = CString::new(v) {
                     cd.set_str(&name, &v);

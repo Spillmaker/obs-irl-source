@@ -25,6 +25,7 @@ fn config() -> Config {
             catchup_percent: consts::DEFAULT_CATCHUP_PERCENT as i32,
             wait_for_keyframe: consts::DEFAULT_WAIT_FOR_KEYFRAME,
             clear_on_disconnect: consts::DEFAULT_CLEAR_ON_DISCONNECT,
+            sync_enabled: false,
             watermarks: Watermarks::derive(consts::DEFAULT_BUFFER_TARGET_MS as i32),
         },
         close_when_inactive: consts::DEFAULT_CLOSE_WHEN_INACTIVE,

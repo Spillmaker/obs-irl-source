@@ -65,6 +65,7 @@ impl Config {
                     .clamp(consts::CATCHUP_PERCENT_MIN, consts::CATCHUP_PERCENT_MAX),
                 wait_for_keyframe: settings.get_bool(c"wait_for_keyframe"),
                 clear_on_disconnect: settings.get_bool(c"clear_on_disconnect"),
+                sync_enabled: settings.get_bool(c"sync_enabled"),
                 // A non-positive target falls back to the default, as
                 // `config_load` does.
                 watermarks: Watermarks::derive(settings.get_i64(c"buffer_target_ms") as i32),
@@ -148,6 +149,10 @@ impl Config {
             .hot
             .clear_on_disconnect
             .store(self.hot.clear_on_disconnect, Relaxed);
+        shared
+            .hot
+            .sync_enabled
+            .store(self.hot.sync_enabled, Relaxed);
 
         effective
     }

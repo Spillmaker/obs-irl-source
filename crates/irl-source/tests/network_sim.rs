@@ -156,6 +156,7 @@ impl Sim {
                 catchup_percent: consts::DEFAULT_CATCHUP_PERCENT as i32,
                 wait_for_keyframe: true,
                 clear_on_disconnect: true,
+                sync_enabled: false,
                 watermarks: wm,
             },
             Arc::new(LifetimeStats::default()),

@@ -33,6 +33,7 @@ use irl_core::{SpeedCarry, SpeedController, SpeedInputs, consts, dsp, timing};
 
 use crate::audio::AudioSink;
 use crate::shared::{AudioState, LifetimeStats, Shared};
+use crate::sync::control::{fresh_anchor_ns, prime_held};
 
 /// Bytes one interleaved float sample occupies.
 const SAMPLE_BYTES: usize = 4;
@@ -222,20 +223,35 @@ impl AudioPump {
                     "Audio output stalled {}ms; restarting output clock",
                     (now - next_ts) / 1_000_000
                 );
-                state.anchor_ns = now + chunk_ns;
+                // Timecode sync re-places the clock line here too: a restart
+                // that anchored at "now" would throw away the placement.
+                state.anchor_ns = fresh_anchor_ns(shared, state, now, chunk_ns);
                 state.samples = 0;
                 state.conceal_fade_pending = true;
             }
         }
 
         if !state.primed {
+            // Timecode sync seeds a multi-second hold the moment it engages.
+            // Priming before that means the hold lands on a running pipeline
+            // and starves it; priming after costs nothing, because nothing is
+            // playing yet. Bounded by a deadline on the other side, so a feed
+            // that can never sync still gets audio.
+            if prime_held(shared) {
+                return false;
+            }
+
             let prime_ms = timing::prime_threshold_ms(fmt.target_ms, lead_ns, low_latency);
             if !has_audio || fill_ms < prime_ms {
                 return false;
             }
 
             state.primed = true;
-            state.anchor_ns = now + chunk_ns;
+            // The one instant a stream can be placed exactly and for free:
+            // nothing is playing yet, so starting later costs only pre-roll.
+            // Correcting afterwards means moving a running pipeline, which
+            // only the speed controller can do.
+            state.anchor_ns = fresh_anchor_ns(shared, state, now, chunk_ns);
             state.samples = 0;
             // Reads and writes are both whole decoded chunks, so the residual
             // can only ever be a multiple of one: a 120ms target is not a
@@ -674,7 +690,8 @@ fn maybe_reanchor_offset(
         return;
     }
 
-    state.anchor_ns = now + chunk_ns;
+    // Through the sync placement, like every other restart of the clock line.
+    state.anchor_ns = fresh_anchor_ns(shared, state, now, chunk_ns);
     state.samples = 0;
     state.latest_obs_end_ts_ns = 0;
     state.latest_buffered_end_pts_ns = 0;

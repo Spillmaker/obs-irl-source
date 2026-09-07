@@ -104,6 +104,7 @@ fn hot_values() -> HotValues {
         catchup_percent: irl_core::consts::DEFAULT_CATCHUP_PERCENT as i32,
         wait_for_keyframe: true,
         clear_on_disconnect: true,
+        sync_enabled: false,
         watermarks: irl_core::Watermarks::derive(irl_core::consts::DEFAULT_BUFFER_TARGET_MS as i32),
     }
 }

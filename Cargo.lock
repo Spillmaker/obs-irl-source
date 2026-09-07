@@ -194,6 +194,7 @@ dependencies = [
  "irl-ffmpeg",
  "obs",
  "parking_lot",
+ "sync-dock",
 ]
 
 [[package]]

@@ -93,6 +93,7 @@ fn make_shared(low_latency: bool, adaptive: bool) -> Arc<Shared> {
         catchup_percent: consts::DEFAULT_CATCHUP_PERCENT as i32,
         wait_for_keyframe: true,
         clear_on_disconnect: true,
+        sync_enabled: false,
         watermarks: Watermarks {
             target_ms: 120,
             min_ms: 60,
