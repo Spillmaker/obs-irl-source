@@ -177,18 +177,18 @@ dependencies = [
 
 [[package]]
 name = "irl-core"
-version = "2.0.0"
+version = "2.0.1"
 
 [[package]]
 name = "irl-ffmpeg"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "ffmpeg-sys-next",
 ]
 
 [[package]]
 name = "irl-source"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "irl-core",
  "irl-ffmpeg",
@@ -288,14 +288,14 @@ dependencies = [
 
 [[package]]
 name = "obs"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "obs-sys",
 ]
 
 [[package]]
 name = "obs-sys"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "bindgen",
 ]
@@ -452,6 +452,13 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "sync-dock"
+version = "2.0.1"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

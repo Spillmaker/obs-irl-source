@@ -6,6 +6,7 @@ members = [
     "crates/ffmpeg",
     "crates/irl-core",
     "crates/irl-source",
+    "crates/sync-dock",
 ]
 
 [workspace.package]
@@ -23,6 +24,7 @@ obs-sys = { path = "crates/obs-sys" }
 obs = { path = "crates/obs" }
 irl-ffmpeg = { path = "crates/ffmpeg" }
 irl-core = { path = "crates/irl-core" }
+sync-dock = { path = "crates/sync-dock" }
 # The bundled FFmpeg is located through FFMPEG_DIR (see .cargo/config.toml);
 # `static` makes the sys crate emit static link lines for the five libav*
 # archives. The transitive libraries (srt, rist, mbedtls, ...) are linked by
@@ -30,6 +32,7 @@ irl-core = { path = "crates/irl-core" }
 ffmpeg-sys-next = { version = "9.0", default-features = false, features = ["static", "avcodec", "avformat", "swresample", "swscale"] }
 parking_lot = "0.12"
 bindgen = "0.72"
+cc = "1"
 
 [profile.release]
 opt-level = 3
