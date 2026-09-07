@@ -136,7 +136,13 @@ fn open_decoder(
 ///
 /// The caller holds `audio_state`: the timestamp claim advances the shared
 /// output clock that the audio pump also uses.
-fn fade_out_buffered_audio(shared: &Shared, state: &mut AudioState) {
+/// The sink and clock are injectable to test delayed disconnects without OBS.
+pub fn fade_out_buffered_audio(
+    shared: &Shared,
+    state: &mut AudioState,
+    sink: &dyn audio::AudioSink,
+    now_ns: impl FnOnce() -> u64,
+) {
     let mut guard = shared.audio_buf();
     let Some(buf) = guard.as_mut() else { return };
 
@@ -169,8 +175,15 @@ fn fade_out_buffered_audio(shared: &Shared, state: &mut AudioState) {
     let sample_rate = buf.sample_rate() as u32;
     drop(guard);
 
+    // The pump is paused during disconnect. Never submit its old timeline
+    // after a slow teardown or a stalled worker: OBS would compensate for
+    // the late audio by growing its global buffering. A disconnect already
+    // discards the remaining input, so discard an expired fade as well.
+    if irl_core::timing::output_next_ts(state.anchor_ns, state.samples, sample_rate) < now_ns() {
+        return;
+    }
     let timestamp = audio::output_claim(state, frames, sample_rate);
-    shared.source.output_audio(&obs::AudioFrame::interleaved(
+    sink.output_audio(&obs::AudioFrame::interleaved(
         &fade_buf[..got],
         frames,
         obs::SpeakerLayout::from_channels(channels),
@@ -442,12 +455,20 @@ impl Receiver {
             shared.conn.total_audio_frames.load(Relaxed)
         );
 
+        // Finish audio while its output clock is still current. Transport
+        // teardown can block (notably SRT close), and the paused pump cannot
+        // keep the clock ahead of wall time during that wait.
+        {
+            let mut state = shared.audio_state();
+            fade_out_buffered_audio(&shared, &mut state, &shared.source, obs::time::gettime_ns);
+        }
+
         self.close_ffmpeg();
 
         // Blank the source instead of leaving the last decoded frame frozen
         // on screen, matching what OBS's own media source does on media end
         // (its clear_on_media_end, likewise on by default). The audio fade-out
-        // below is the same idea for the other half of the stream. The video
+        // above is the same idea for the other half of the stream. The video
         // thread performs the actual clear.
         if shared.hot.clear_on_disconnect.load(Relaxed) {
             shared.video.request_clear();
@@ -455,7 +476,6 @@ impl Receiver {
 
         {
             let mut state = shared.audio_state();
-            fade_out_buffered_audio(&shared, &mut state);
             if let Some(buf) = shared.audio_buf().as_mut() {
                 buf.flush();
             }

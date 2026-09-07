@@ -124,6 +124,11 @@ impl AudioPump {
         // is not recursive. Buffer-mutex calls nest underneath it, which is
         // the documented order (audio state lock, then buffer).
         let mut state = shared.audio_state();
+        // Re-check under the same lock as the disconnect fade. The receiver
+        // can pause playback while a pump burst is already in progress.
+        if shared.flags.reconnecting.load(Relaxed) {
+            return false;
+        }
         self.pump_locked(&shared, &mut state)
     }
 

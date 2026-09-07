@@ -142,6 +142,69 @@ fn expected_ts(anchor: u64, samples: u64, rate: u64) -> u64 {
 
 // ── Tests ─────────────────────────────────────────────────────
 
+#[test]
+fn a_pump_burst_stops_when_disconnect_pauses_playback() {
+    let shared = make_shared(false, false);
+    let clock = Arc::new(AtomicU64::new(1_000_000_000));
+    let recorder = Recorder::new(CHANNELS as usize);
+    let mut pump = make_pump(&shared, &clock, &recorder);
+    for i in 0..15 {
+        write_chunk(&shared, i * CHUNK_NS as i64, 0.25);
+    }
+    assert!(pump.pump_once());
+    let count = recorder.len();
+    let samples = shared.audio_state().samples;
+    shared.flags.reconnecting.store(true, Relaxed);
+    clock.fetch_add(1_000_000_000, Relaxed);
+    assert!(!pump.pump_once());
+    assert_eq!(recorder.len(), count);
+    assert_eq!(shared.audio_state().samples, samples);
+}
+
+/// A slow transport close must not submit a fade from the stopped clock:
+/// OBS can enlarge its global audio buffer to accommodate that late audio.
+#[test]
+fn disconnect_fade_does_not_submit_stale_audio() {
+    for rate in [44_100, 48_000] {
+        for teardown_ns in [0, 1_000_000_000] {
+            let shared = make_shared(false, true);
+            let recorder = Recorder::new(CHANNELS as usize);
+            let now = 10_000_000_000;
+            *shared.audio_buf() = AudioBuffer::new(rate, CHANNELS, 4, 120, 60, 320);
+            let data = vec![0u8; rate as usize / 10 * CHANNELS as usize * 4];
+            shared
+                .audio_buf()
+                .as_mut()
+                .unwrap()
+                .write_pts(&data, 1_000_000_000);
+            let mut state = shared.audio_state();
+            state.primed = true;
+            state.anchor_ns = now + 80_000_000;
+            obs_irl_source::receiver::stream::fade_out_buffered_audio(
+                &shared,
+                &mut state,
+                &recorder,
+                || now + teardown_ns,
+            );
+            let emitted = recorder.emitted.lock();
+            if teardown_ns == 0 {
+                assert_eq!(emitted.len(), 1);
+                assert_eq!(emitted[0].timestamp, now + 80_000_000);
+                assert_eq!(emitted[0].rate, rate as u32);
+            } else {
+                assert!(
+                    emitted.is_empty(),
+                    "{rate}Hz disconnect submitted audio 920ms late"
+                );
+                assert_eq!(
+                    state.samples, 0,
+                    "a discarded fade must not claim output samples"
+                );
+            }
+        }
+    }
+}
+
 /// OBS smooths under 70 ms, zero-fills 70 ms..2 s and flushes beyond that, so
 /// the one property the output clock may never break is `ts[n+1] = ts[n] +
 /// frames/rate` — here over 10 000 consecutive chunks of a healthy stream.
