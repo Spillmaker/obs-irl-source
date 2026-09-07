@@ -41,6 +41,19 @@ fn distinct_snapshot() -> StatsSnapshot {
         stream_delay_ms: 122,
         low_latency_audio: true,
         reconnect_count: 123,
+        sync_enabled: true,
+        sync_status: irl_core::SyncStatus::Acquiring,
+        sync_timecode: Some(irl_core::Timecode {
+            hours: 12,
+            minutes: 34,
+            seconds: 56,
+            n_frames: 7,
+        }),
+        sync_latency_ms: 124,
+        sync_latency_peak_ms: 125,
+        sync_added_ms: 126,
+        sync_error_ms: 127,
+        sync_required_offset_ms: 128,
     }
 }
 
@@ -85,7 +98,8 @@ fn a_default_snapshot_writes_zeroes_not_absences() {
             StatKind::Int => assert_eq!(cd.get_i64(&key), Some(0), "{name}"),
             StatKind::Float => assert_eq!(cd.get_f64(&key), Some(0.0), "{name}"),
             StatKind::Bool => assert_eq!(cd.get_bool(&key), Some(false), "{name}"),
-            // An empty string is present, not absent.
+            // The status reads "off" and the timecode reads empty: present,
+            // not absent.
             StatKind::String => assert!(cd.get_str(&key).is_some(), "{name}"),
         }
     }
@@ -105,4 +119,16 @@ fn the_declaration_names_exactly_what_is_written() {
     }
     // The dropped stat is gone from every surface, not just the table.
     assert!(!decl.contains("video_decoder_flushes"));
+}
+
+/// The two string stats round-trip through calldata as the C
+/// `calldata_set_string` / `calldata_get_string` pair would carry them.
+#[test]
+fn the_string_stats_carry_the_status_name_and_the_timecode() {
+    let mut cd = CallData::new();
+    write_stats(&mut cd, &distinct_snapshot());
+    assert_eq!(cd.get_str(c"sync_status"), Some("acquiring"));
+    assert_eq!(cd.get_str(c"sync_timecode"), Some("12:34:56:07"));
+    assert_eq!(cd.get_bool(c"sync_enabled"), Some(true));
+    assert_eq!(cd.get_i64(c"sync_required_offset_ms"), Some(128));
 }

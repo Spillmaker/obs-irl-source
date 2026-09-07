@@ -16,11 +16,14 @@ pub mod audio_buffer;
 pub mod config;
 pub mod consts;
 pub mod dsp;
+pub mod ntp;
 pub mod pacing;
 pub mod pts_repair;
 mod rescale;
+pub mod sei;
 pub mod speed;
 pub mod stats;
+pub mod sync;
 pub mod timing;
 pub mod url_opts;
 pub mod video_time;
@@ -30,8 +33,10 @@ pub use config::{HwDecode, Watermarks};
 pub use dsp::LastSample;
 pub use pacing::{DueVerdict, PacedFrame, PacingQueue};
 pub use pts_repair::{PtsAction, PtsRepair, Verdict};
+pub use sei::Timecode;
 pub use speed::{
     DrainWatch, SpeedCarry, SpeedController, SpeedInputs, SpeedTrim, StuckReport, catchup_speed_max,
 };
 pub use stats::{StatKind, StatValue, StatsSnapshot};
+pub use sync::{SyncSnapshot, SyncStatus, TcReason};
 pub use url_opts::url_awaits_caller;

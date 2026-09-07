@@ -2,6 +2,9 @@
 //! calldata writer and the websocket vendor's copy loop all iterate
 //! [`FIELDS`], so a new stat is a one-line change.
 
+use crate::sei::Timecode;
+use crate::sync::SyncStatus;
+
 /// calldata type of a stat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatKind {
@@ -28,7 +31,8 @@ pub enum StatValue {
     Str(String),
 }
 
-/// The 27 stat fields in proc-declaration order.
+/// The 35 stat fields in proc-declaration order: the 27 of the C plugin, plus
+/// the eight the timecode sync branch contributes (`IRL_SYNC_STATS_PROC_DECL`).
 pub const FIELDS: &[(&str, StatKind)] = &[
     ("buffer_fill_ms", StatKind::Int),
     ("current_speed", StatKind::Float),
@@ -57,6 +61,15 @@ pub const FIELDS: &[(&str, StatKind)] = &[
     ("stream_delay_ms", StatKind::Int),
     ("low_latency_audio", StatKind::Bool),
     ("reconnect_count", StatKind::Int),
+    // ── timecode sync ──
+    ("sync_enabled", StatKind::Bool),
+    ("sync_status", StatKind::String),
+    ("sync_timecode", StatKind::String),
+    ("sync_latency_ms", StatKind::Int),
+    ("sync_latency_peak_ms", StatKind::Int),
+    ("sync_added_ms", StatKind::Int),
+    ("sync_error_ms", StatKind::Int),
+    ("sync_required_offset_ms", StatKind::Int),
 ];
 
 /// A snapshot of every stat, in [`FIELDS`] order.
@@ -116,6 +129,25 @@ pub struct StatsSnapshot {
     pub low_latency_audio: bool,
     /// Reconnects.
     pub reconnect_count: i64,
+    /// This source is ticked for timecode sync.
+    pub sync_enabled: bool,
+    /// Sync status (`off`, `no_timecode`, `stale`, `too_slow`, `acquiring`,
+    /// `locked`).
+    pub sync_status: SyncStatus,
+    /// Most recent timecode from the sender; reported as `HH:MM:SS:FF`, empty
+    /// when none.
+    pub sync_timecode: Option<Timecode>,
+    /// How stale the freshest received frame is, from its timecode against NTP.
+    pub sync_latency_ms: i64,
+    /// Rolling 60s maximum of the above.
+    pub sync_latency_peak_ms: i64,
+    /// Extra hold currently applied to reach the target presentation time.
+    pub sync_added_ms: i64,
+    /// How far the actual presentation lands from the target, averaged over
+    /// about a second.
+    pub sync_error_ms: i64,
+    /// Smallest offset at which this source could hold sync.
+    pub sync_required_offset_ms: i64,
 }
 
 impl StatKind {
@@ -161,6 +193,18 @@ impl StatsSnapshot {
             StatValue::Int(self.stream_delay_ms),
             StatValue::Bool(self.low_latency_audio),
             StatValue::Int(self.reconnect_count),
+            StatValue::Bool(self.sync_enabled),
+            StatValue::Str(self.sync_status.name().to_owned()),
+            StatValue::Str(
+                self.sync_timecode
+                    .map(|tc| tc.to_string())
+                    .unwrap_or_default(),
+            ),
+            StatValue::Int(self.sync_latency_ms),
+            StatValue::Int(self.sync_latency_peak_ms),
+            StatValue::Int(self.sync_added_ms),
+            StatValue::Int(self.sync_error_ms),
+            StatValue::Int(self.sync_required_offset_ms),
         ]
     }
 
@@ -195,7 +239,9 @@ mod tests {
 
     /// The declaration `irl_source_create` passed to `proc_handler_add`
     /// (`src/irl-source.c`), with `out int video_decoder_flushes` removed —
-    /// that stat was always zero and is not ported.
+    /// that stat was always zero and is not ported — and the timecode sync
+    /// branch's `IRL_SYNC_STATS_PROC_DECL` appended, as its `irl-source.c`
+    /// did.
     const C_DECLARATION: &str = "void get_stats(out int buffer_fill_ms, \
 out float current_speed, out bool adaptive_latency_control, \
 out bool reconnecting, \
@@ -212,11 +258,16 @@ out int audio_decoder_flushes, \
 out int video_corrupt_frames, out int video_corrupt_held, \
 out int video_lead_ms, out int video_lead_excess, \
 out int stream_delay_ms, out bool low_latency_audio, \
-out int reconnect_count)";
+out int reconnect_count, \
+out bool sync_enabled, \
+out string sync_status, out string sync_timecode, \
+out int sync_latency_ms, out int sync_latency_peak_ms, \
+out int sync_added_ms, out int sync_error_ms, \
+out int sync_required_offset_ms)";
 
     #[test]
-    fn there_are_twenty_seven_fields() {
-        assert_eq!(FIELDS.len(), 27);
+    fn there_are_thirty_five_fields() {
+        assert_eq!(FIELDS.len(), 35);
         // video_decoder_flushes was removed (it was always 0 in C).
         assert!(
             !FIELDS
@@ -271,6 +322,19 @@ out int reconnect_count)";
             stream_delay_ms: 22,
             low_latency_audio: true,
             reconnect_count: 23,
+            sync_enabled: true,
+            sync_status: SyncStatus::Locked,
+            sync_timecode: Some(Timecode {
+                hours: 1,
+                minutes: 2,
+                seconds: 3,
+                n_frames: 4,
+            }),
+            sync_latency_ms: 24,
+            sync_latency_peak_ms: 25,
+            sync_added_ms: 26,
+            sync_error_ms: 27,
+            sync_required_offset_ms: 28,
         };
 
         let values = snap.values();
@@ -307,11 +371,18 @@ out int reconnect_count)";
         assert_eq!(values[2], StatValue::Bool(true));
         assert_eq!(values[3], StatValue::Bool(true));
         assert_eq!(values[25], StatValue::Bool(true));
+        assert_eq!(values[27], StatValue::Bool(true));
+        assert_eq!(values[28], StatValue::Str("locked".to_owned()));
+        assert_eq!(values[29], StatValue::Str("01:02:03:04".to_owned()));
 
         // Spot-check the by-name accessor against the same snapshot.
         assert_eq!(snap.get("buffer_fill_ms"), Some(StatValue::Int(1)));
         assert_eq!(snap.get("reconnect_count"), Some(StatValue::Int(23)));
         assert_eq!(snap.get("low_latency_audio"), Some(StatValue::Bool(true)));
+        assert_eq!(
+            snap.get("sync_required_offset_ms"),
+            Some(StatValue::Int(28))
+        );
         assert_eq!(snap.get("video_decoder_flushes"), None);
     }
 
@@ -323,9 +394,13 @@ out int reconnect_count)";
                 StatValue::Int(v) => *v == 0,
                 StatValue::Float(v) => *v == 0.0,
                 StatValue::Bool(v) => !*v,
-                StatValue::Str(s) => s.is_empty(),
+                // No timecode reads as the empty string; the status reads as
+                // "off", which is the C's zero-valued enum.
+                StatValue::Str(s) => s.is_empty() || s == "off",
             };
             assert!(zero, "{} defaulted to {value:?}", FIELDS[i].0);
         }
+        assert_eq!(values[28], StatValue::Str("off".to_owned()));
+        assert_eq!(values[29], StatValue::Str(String::new()));
     }
 }
