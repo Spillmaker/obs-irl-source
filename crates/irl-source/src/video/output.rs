@@ -257,6 +257,16 @@ impl VideoThread {
         computed
     }
 
+    /// Whether audio has published a playout mapping at all — the same test
+    /// [`Self::due_time`] makes, without the hold [`Self::playout_offset`]
+    /// applies after one goes away. The anchor logic needs the live answer:
+    /// a held offset belongs to audio that has stopped, and anchoring on it
+    /// would be anchoring on a guess.
+    pub fn mapping_published(&self) -> bool {
+        let state = self.shared.audio_state();
+        state.latest_obs_end_ts_ns != 0 && state.latest_buffered_end_pts_ns > 0
+    }
+
     /// `irl_video_playout_offset` (`video-handler.c:431-453`): the current
     /// stream-PTS → OBS-clock offset, for re-deriving the due time of frames
     /// already queued.

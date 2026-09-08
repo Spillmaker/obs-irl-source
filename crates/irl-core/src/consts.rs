@@ -291,6 +291,22 @@ pub const VIDEO_PACING_MAX_LEAD_NS: u64 = 50_000_000;
 pub const VIDEO_CANVAS_TICK_DEFAULT_NS: u64 = 16_666_667;
 /// Ceiling on a single pacing sleep.
 pub const VIDEO_PACING_MAX_WAIT_MS: u64 = 50;
+
+/// Margin past the audio prime estimate that video waits for the audio playout
+/// mapping before anchoring libobs's play head on its own clock.
+///
+/// While an audio stream is present, the first frame handed to libobs must go
+/// out at the due time the *audio mapping* gives it, because libobs anchors its
+/// play head to that frame's arrival and never moves it again. Before the
+/// mapping exists the only schedule available is the video-only fallback, and
+/// the two disagree by roughly the output lead plus a chunk (~100 ms) in one
+/// direction, or by whatever audio warm-up remained in the other — so a
+/// connection anchored on a fallback frame plays the whole way with that
+/// lip-sync error baked in. Video therefore holds until audio primes. The
+/// prime is expected within `STARTUP_AUDIO_WARMUP_MS + target + AUDIO_OUT_LEAD_MS`;
+/// this is the slack past that before a stream whose audio never arrives is
+/// let through on the fallback anyway.
+pub const VIDEO_ANCHOR_WAIT_MARGIN_MS: i64 = 1000;
 /// How long the last audio playout offset is reused after it goes away.
 pub const VIDEO_OFFSET_HOLD_NS: u64 = 500_000_000;
 /// Video-only fallback: clamp on drift between stream and system clock.
@@ -426,6 +442,7 @@ mod tests {
         assert_eq!(VIDEO_PACING_MAX_BYTES, 1_073_741_824); // IRL_VIDEO_PACING_MAX_BYTES
         assert_eq!(VIDEO_PACING_SLACK_NS, 1_000_000); // IRL_VIDEO_PACING_SLACK_NS
         assert_eq!(VIDEO_PACING_LEAD_TICKS, 2); // IRL_VIDEO_PACING_LEAD_TICKS
+        assert_eq!(VIDEO_ANCHOR_WAIT_MARGIN_MS, 1000);
         assert_eq!(VIDEO_PACING_MAX_LEAD_NS, 50_000_000); // IRL_VIDEO_PACING_MAX_LEAD_NS
         assert_eq!(VIDEO_CANVAS_TICK_DEFAULT_NS, 16_666_667); // IRL_VIDEO_CANVAS_TICK_DEFAULT_NS
         assert_eq!(VIDEO_PACING_MAX_WAIT_MS, 50); // IRL_VIDEO_PACING_MAX_WAIT_MS
