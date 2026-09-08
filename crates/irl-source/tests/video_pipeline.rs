@@ -978,6 +978,38 @@ fn video_stops_waiting_for_audio_that_never_primes() {
     assert_eq!(recorder.only().timestamp, due);
 }
 
+/// Timecode sync may hold audio back from priming for up to its own deadline;
+/// that time does not count against the video wait, or video would anchor on
+/// the fallback just before the mapping it was waiting for appears.
+#[test]
+fn a_sync_prime_hold_does_not_run_down_the_video_wait() {
+    let shared = shared_with_audio();
+    shared.sync_flags.prime_hold.store(true, Relaxed);
+    let (mut thread, recorder) = thread_with(shared.clone());
+
+    let now = obs::time::gettime_ns();
+    let mut first = sw_frame(Pix::AV_PIX_FMT_YUV420P, 64, 32);
+    first.set_pts(10_000_000_000);
+    thread.pace_decoded(first);
+    thread.run_once(now);
+    thread.run_once(now + 2_500_000_000);
+    assert!(
+        recorder.emitted().is_empty(),
+        "held for as long as sync holds priming"
+    );
+
+    // The hold lifts with audio still unprimed: the wait starts from here.
+    shared.sync_flags.prime_hold.store(false, Relaxed);
+    thread.run_once(now + 2_500_000_000);
+    thread.run_once(now + 2_500_000_000 + 1_349_000_000);
+    assert!(
+        recorder.emitted().is_empty(),
+        "a full wait from when the hold lifted"
+    );
+    thread.run_once(now + 2_500_000_000 + 1_351_000_000);
+    assert_eq!(thread.paced_len(), 0, "gave up: the stale frame is dropped");
+}
+
 /// Without an audio stream the video-only fallback anchors immediately, as it
 /// always did: there is nothing to wait for and nothing to be in sync with.
 #[test]
