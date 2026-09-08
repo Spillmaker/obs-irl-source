@@ -835,3 +835,159 @@ fn a_disabled_keyframe_gate_passes_non_key_frames() {
     assert!(intake_frame(&shared, &mut state, &frame, H264).is_some());
     assert!(shared.video_flags.first_keyframe.load(Relaxed));
 }
+
+/* ── Anchoring libobs's play head to the audio playout ────── */
+
+/// Audio publishes where video belongs: its chunk ending at stream PTS
+/// `buffered_end_pts_ns` plays out at OBS time `obs_end_ts_ns`.
+fn publish_mapping(shared: &Shared, obs_end_ts_ns: u64, buffered_end_pts_ns: i64) {
+    let mut state = shared.audio_state();
+    state.latest_obs_end_ts_ns = obs_end_ts_ns;
+    state.latest_buffered_end_pts_ns = buffered_end_pts_ns;
+}
+
+fn shared_with_audio() -> Arc<Shared> {
+    let shared = shared();
+    shared.flags.audio_present.store(true, Relaxed);
+    // By the time the first keyframe decodes the audio warm-up has drained, so
+    // the fallback would put that frame just one Target Buffer out — ~100 ms
+    // before the mapping audio is about to publish will want it.
+    shared.audio_state().startup_warmup_remaining_ms = 0;
+    shared
+}
+
+/// libobs anchors its play head to the *arrival* of the first frame and never
+/// moves it, so a frame handed over on the video-only fallback fixes the
+/// connection's lip sync at whatever the fallback got wrong. With an audio
+/// stream present, nothing goes out until audio has said where video belongs.
+#[test]
+fn video_waits_for_the_audio_mapping_before_anchoring_the_play_head() {
+    let shared = shared_with_audio();
+    let (mut thread, recorder) = thread_with(shared.clone());
+
+    let now = obs::time::gettime_ns();
+    let mut first = sw_frame(Pix::AV_PIX_FMT_YUV420P, 64, 32);
+    first.set_pts(10_000_000_000);
+    thread.pace_decoded(first);
+
+    // Well past the fallback due time (+120 ms): still held.
+    let wait = thread.run_once(now + 300_000_000);
+    assert!(
+        recorder.emitted().is_empty(),
+        "no mapping yet, nothing may anchor"
+    );
+    assert!(!wait.is_zero(), "holding must not spin the thread");
+
+    // Audio primes: the chunk ending at stream PTS 10 s plays at +400 ms.
+    publish_mapping(&shared, now + 400_000_000, 10_000_000_000);
+    thread.run_once(now + 350_000_000);
+    assert!(recorder.emitted().is_empty(), "due at +400 ms, not before");
+    thread.run_once(now + 400_000_000);
+    assert_eq!(recorder.only().timestamp, now + 400_000_000);
+}
+
+/// The mapping can also land frames in the past — the ones whose audio the
+/// warm-up discarded. Handing those over would anchor the play head late by
+/// however stale the first one was; they are dropped instead, and the first
+/// frame that is on time anchors.
+#[test]
+fn frames_already_past_due_when_the_mapping_arrives_do_not_anchor_the_play_head() {
+    let shared = shared_with_audio();
+    let (mut thread, recorder) = thread_with(shared.clone());
+
+    // 25 fps: 40 ms apart, so no two frames fall inside one 60fps tick.
+    let now = obs::time::gettime_ns();
+    for i in 0..4 {
+        let mut frame = sw_frame(Pix::AV_PIX_FMT_YUV420P, 64, 32);
+        frame.set_pts(10_000_000_000 + i * 40_000_000);
+        thread.pace_decoded(frame);
+    }
+    thread.run_once(now);
+    assert!(recorder.emitted().is_empty());
+    assert_eq!(thread.paced_len(), 4);
+
+    // Audio primes so that the first three frames map 100, 60 and 20 ms into
+    // the past — all past a canvas tick — and the fourth lands 20 ms out.
+    publish_mapping(&shared, now - 100_000_000, 10_000_000_000);
+    thread.run_once(now);
+    assert!(
+        recorder.emitted().is_empty(),
+        "the stale frames must not go out in place of the on-time one"
+    );
+    assert_eq!(thread.paced_len(), 1, "three stale frames dropped");
+
+    thread.run_once(now + 20_000_000);
+    assert_eq!(recorder.only().timestamp, now + 20_000_000);
+}
+
+/// A frame late by less than a canvas tick still anchors: libobs quantises
+/// display to its ticks, and a coarse timer can oversleep by most of one.
+#[test]
+fn a_frame_late_by_under_a_canvas_tick_still_anchors() {
+    let shared = shared_with_audio();
+    let (mut thread, recorder) = thread_with(shared.clone());
+
+    let now = obs::time::gettime_ns();
+    let mut frame = sw_frame(Pix::AV_PIX_FMT_YUV420P, 64, 32);
+    frame.set_pts(10_000_000_000);
+    thread.pace_decoded(frame);
+    publish_mapping(&shared, now, 10_000_000_000);
+
+    thread.run_once(now + 10_000_000);
+    assert_eq!(
+        recorder.only().timestamp,
+        now,
+        "10 ms late is within a 60fps tick"
+    );
+}
+
+/// A stream that advertises audio but never primes it cannot hold video
+/// forever: past the expected prime the fallback anchors as before.
+#[test]
+fn video_stops_waiting_for_audio_that_never_primes() {
+    let shared = shared_with_audio();
+    let (mut thread, recorder) = thread_with(shared.clone());
+
+    let now = obs::time::gettime_ns();
+    let mut first = sw_frame(Pix::AV_PIX_FMT_YUV420P, 64, 32);
+    first.set_pts(10_000_000_000);
+    thread.pace_decoded(first);
+    thread.run_once(now);
+    assert!(recorder.emitted().is_empty());
+
+    // warm-up 150 + target 120 + lead 80 + margin 1000.
+    let give_up = now + 1_350_000_000;
+    thread.run_once(give_up - 1_000_000);
+    assert!(recorder.emitted().is_empty(), "still inside the wait");
+
+    // Past it: the held frame is stale by more than a tick and is dropped,
+    // and a fresh frame goes out on the fallback at its own due time.
+    thread.run_once(give_up + 1_000_000);
+    assert!(recorder.emitted().is_empty());
+    assert_eq!(
+        thread.paced_len(),
+        0,
+        "the stale frame was dropped, not anchored"
+    );
+
+    let mut fresh = sw_frame(Pix::AV_PIX_FMT_YUV420P, 64, 32);
+    fresh.set_pts(10_000_000_000 + 1_400_000_000);
+    thread.pace_decoded(fresh);
+    let due = thread.next_due_ns().expect("paced on the fallback");
+    thread.run_once(due);
+    assert_eq!(recorder.only().timestamp, due);
+}
+
+/// Without an audio stream the video-only fallback anchors immediately, as it
+/// always did: there is nothing to wait for and nothing to be in sync with.
+#[test]
+fn video_without_audio_anchors_on_the_fallback_at_once() {
+    let shared = shared();
+    let (mut thread, recorder) = thread_with(shared.clone());
+
+    let mut first = sw_frame(Pix::AV_PIX_FMT_YUV420P, 64, 32);
+    first.set_pts(obs::time::gettime_ns() as i64);
+    thread.pace_decoded(first);
+    thread.run_once(obs::time::gettime_ns());
+    assert_eq!(recorder.emitted().len(), 1);
+}

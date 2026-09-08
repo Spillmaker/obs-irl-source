@@ -59,6 +59,18 @@ impl PacedFrame for Paced {
     }
 }
 
+/// The video thread's wait for the audio playout mapping before it anchors
+/// libobs's play head; see [`VideoThread::awaiting_audio_mapping`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AnchorWait {
+    /// Not waiting: no frame has needed the mapping yet, or it exists.
+    Idle,
+    /// Holding video since this OBS time.
+    Waiting(u64),
+    /// Audio never primed; the fallback anchors this connection.
+    GaveUp,
+}
+
 /// Video-thread-owned state. Nothing here is locked: the receiver thread never
 /// touches it, and the counters it mirrors into [`LifetimeStats`] once per
 /// cycle are atomics.
@@ -99,6 +111,9 @@ pub struct VideoThread {
     /// goes at its due time rather than a lead early. See
     /// [`Self::emit_slack_ns`].
     anchor_pending: bool,
+    /// Where the wait for the audio playout mapping stands. See
+    /// [`Self::awaiting_audio_mapping`].
+    anchor_wait: AnchorWait,
     /// The OBS canvas tick. Injectable so tests can drive pacing without a
     /// running libobs — `obs_get_frame_interval_ns` reads libobs's global
     /// video state and faults when `obs_startup` never ran.
@@ -139,6 +154,7 @@ impl VideoThread {
             lead_warn_time_ns: 0,
             // A fresh source has libobs's `last_frame_ts` at 0 too.
             anchor_pending: true,
+            anchor_wait: AnchorWait::Idle,
             canvas_tick_ns: Box::new(obs::time::canvas_frame_interval_ns),
             sink,
         }
@@ -185,6 +201,7 @@ impl VideoThread {
             // `obs_source_output_video(NULL)` resets libobs's `last_frame_ts`
             // to 0, so the next frame re-anchors the play head.
             self.anchor_pending = true;
+            self.anchor_wait = AnchorWait::Idle;
             self.sink.output_video_none();
             return Duration::ZERO;
         }
@@ -198,6 +215,13 @@ impl VideoThread {
         // against the offset as it is now rather than as it was when the
         // frames were decoded.
         self.pacing_reschedule();
+        if self.anchor_pending && self.awaiting_audio_mapping(now_ns) {
+            // Nothing goes out until audio has published where video belongs.
+            // The audio pump wakes this thread the moment it does; the sleep
+            // is only the backstop.
+            self.publish_counters();
+            return Duration::from_millis(consts::VIDEO_PACING_MAX_WAIT_MS);
+        }
         self.pacing_emit_due(now_ns, slack_ns);
         self.publish_counters();
         // Fresh clock for the sleep, as in the C: the emit above may have
@@ -316,6 +340,9 @@ impl VideoThread {
     /// video is what the un-paced path did all the time, and it beats a hole
     /// in the picture.
     fn pacing_emit_due(&mut self, now_ns: u64, slack_ns: i64) {
+        if self.anchor_pending {
+            self.drop_stale_before_anchor(now_ns);
+        }
         loop {
             // While the play head needs anchoring, a hard ceiling must not
             // force the head out early: anchoring from an early frame is the
@@ -340,6 +367,89 @@ impl VideoThread {
             if self.anchor_pending && verdict == DueVerdict::Emit && submitted {
                 self.anchor_pending = false;
             }
+        }
+    }
+
+    /// Whether video must keep waiting for the audio playout mapping before
+    /// it hands libobs the frame that anchors its play head.
+    ///
+    /// libobs anchors the play head to the *arrival* of the first frame after
+    /// a start or a clear and only ever advances it by wall-clock deltas, so
+    /// whatever error that frame's timing carries is the connection's
+    /// lip-sync error for good. Before audio primes the only schedule is the
+    /// video-only fallback, and it does not agree with the mapping audio will
+    /// publish: the fallback places the first frame `Target Buffer` after
+    /// arrival, the mapping places it at the first audio chunk — a prime
+    /// threshold plus a chunk after the first *kept* audio, so ~100 ms later
+    /// when the warm-up had already drained, and earlier than the fallback by
+    /// whatever warm-up remained when it had not. Which case a connection
+    /// lands in is a race between the audio warm-up and the first keyframe.
+    ///
+    /// So while an audio stream is present, video holds until the mapping
+    /// exists and anchors from it. A stream whose audio never primes is let
+    /// through on the fallback once the prime is overdue by
+    /// [`consts::VIDEO_ANCHOR_WAIT_MARGIN_MS`].
+    fn awaiting_audio_mapping(&mut self, now_ns: u64) -> bool {
+        if !self.shared.flags.audio_present.load(Relaxed) {
+            return false;
+        }
+        if self.mapping_published() {
+            self.anchor_wait = AnchorWait::Idle;
+            return false;
+        }
+        let since_ns = match self.anchor_wait {
+            AnchorWait::GaveUp => return false,
+            AnchorWait::Waiting(since_ns) => since_ns,
+            AnchorWait::Idle => {
+                self.anchor_wait = AnchorWait::Waiting(now_ns);
+                now_ns
+            }
+        };
+        let expected_ms = i64::from(consts::STARTUP_AUDIO_WARMUP_MS)
+            + i64::from(self.shared.hot.watermarks().target_ms)
+            + i64::from(consts::AUDIO_OUT_LEAD_MS)
+            + consts::VIDEO_ANCHOR_WAIT_MARGIN_MS;
+        let waited_ms = (now_ns.saturating_sub(since_ns) / 1_000_000) as i64;
+        if waited_ms < expected_ms {
+            return true;
+        }
+        irl_warn!("Audio did not prime within {expected_ms}ms; anchoring video on its own clock");
+        self.anchor_wait = AnchorWait::GaveUp;
+        false
+    }
+
+    /// The frame that anchors libobs's play head must go out at its due time,
+    /// so a head that is already past due cannot be it: drop such frames until
+    /// one that is on time is at the head.
+    ///
+    /// The mapping arriving is what makes frames overdue here — everything
+    /// decoded during the wait maps to the moments its audio was discarded by
+    /// the warm-up or already played — and handing them over would anchor the
+    /// connection late by however stale the first one was. They amount to a
+    /// fraction of a second at connection start and nothing has been shown yet.
+    ///
+    /// "Past due" is measured against a canvas tick, not the emit slack: libobs
+    /// quantises display to its ticks anyway, and a box with a coarse timer can
+    /// oversleep by most of one, which must not make it drop every candidate in
+    /// turn. Without audio there is nothing to be in sync with, and the
+    /// fallback frames go out as they always did.
+    fn drop_stale_before_anchor(&mut self, now_ns: u64) {
+        if !self.shared.flags.audio_present.load(Relaxed) {
+            return;
+        }
+        let tick = (self.canvas_tick_ns)().unwrap_or(consts::VIDEO_CANVAS_TICK_DEFAULT_NS) as i64;
+        let mut dropped = 0u32;
+        while let Some(due_ns) = self.pacing.next_due() {
+            if now_ns as i64 - due_ns as i64 <= tick {
+                break;
+            }
+            self.pacing.pop();
+            dropped += 1;
+        }
+        if dropped > 0 {
+            irl_info!(
+                "Dropped {dropped} stale video frame(s) before anchoring to the audio playout"
+            );
         }
     }
 

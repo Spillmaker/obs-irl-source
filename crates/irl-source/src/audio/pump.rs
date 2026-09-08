@@ -449,6 +449,7 @@ Video stays in sync with it; check the sender's frame rate and clock",
         ));
 
         remember_last_sample(&mut state.out_last, emitted, channels);
+        let first_mapping = state.latest_obs_end_ts_ns == 0;
         finalize_audio_output(
             shared,
             state,
@@ -459,6 +460,12 @@ Video stays in sync with it; check the sender's frame rate and clock",
             stream_duration_ns,
             (self.now_ns)(),
         );
+        if first_mapping {
+            // Video holds its first frame until this mapping exists and then
+            // has about one chunk to hand it over on time; a wake here beats
+            // waiting out its pacing sleep. `notify_all` takes no lock.
+            shared.video.wake_all();
+        }
         true
     }
 
